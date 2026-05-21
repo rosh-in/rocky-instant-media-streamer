@@ -20,6 +20,12 @@ class Settings:
     radarr_monitored: bool
     radarr_search_on_add: bool
     radarr_dry_run: bool
+    justwatch_enabled: bool
+    justwatch_country: str
+    justwatch_language: str
+    justwatch_refresh_hours: int
+    justwatch_max_results: int
+    justwatch_best_only: bool
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -48,6 +54,12 @@ def load_settings() -> Settings:
     radarr_monitored = _as_bool(os.getenv("RADARR_MONITORED", "true"), default=True)
     radarr_search_on_add = _as_bool(os.getenv("RADARR_SEARCH_ON_ADD", "false"), default=False)
     radarr_dry_run = _as_bool(os.getenv("RADARR_DRY_RUN", "true"), default=True)
+    justwatch_enabled = _as_bool(os.getenv("JUSTWATCH_ENABLED", "true"), default=True)
+    justwatch_country = os.getenv("JUSTWATCH_COUNTRY", "IN").strip().upper()
+    justwatch_language = os.getenv("JUSTWATCH_LANGUAGE", "en").strip()
+    justwatch_refresh_hours_raw = os.getenv("JUSTWATCH_REFRESH_HOURS", "168").strip()
+    justwatch_max_results_raw = os.getenv("JUSTWATCH_MAX_RESULTS", "3").strip()
+    justwatch_best_only = _as_bool(os.getenv("JUSTWATCH_BEST_ONLY", "true"), default=True)
 
     if not username:
         raise ValueError("Missing LETTERBOXD_USERNAME in environment.")
@@ -64,11 +76,25 @@ def load_settings() -> Settings:
         radarr_quality_profile_id = int(radarr_quality_profile_id_raw)
     except ValueError as exc:
         raise ValueError("RADARR_QUALITY_PROFILE_ID must be an integer.") from exc
+    try:
+        justwatch_refresh_hours = int(justwatch_refresh_hours_raw)
+    except ValueError as exc:
+        raise ValueError("JUSTWATCH_REFRESH_HOURS must be an integer.") from exc
+    try:
+        justwatch_max_results = int(justwatch_max_results_raw)
+    except ValueError as exc:
+        raise ValueError("JUSTWATCH_MAX_RESULTS must be an integer.") from exc
 
     if max_pages < 1:
         raise ValueError("LETTERBOXD_MAX_PAGES must be >= 1.")
     if radarr_quality_profile_id < 1:
         raise ValueError("RADARR_QUALITY_PROFILE_ID must be >= 1.")
+    if len(justwatch_country) != 2:
+        raise ValueError("JUSTWATCH_COUNTRY must be a 2-letter country code.")
+    if justwatch_refresh_hours < 0:
+        raise ValueError("JUSTWATCH_REFRESH_HOURS must be >= 0.")
+    if justwatch_max_results < 1:
+        raise ValueError("JUSTWATCH_MAX_RESULTS must be >= 1.")
 
     return Settings(
         letterboxd_username=username,
@@ -83,4 +109,10 @@ def load_settings() -> Settings:
         radarr_monitored=radarr_monitored,
         radarr_search_on_add=radarr_search_on_add,
         radarr_dry_run=radarr_dry_run,
+        justwatch_enabled=justwatch_enabled,
+        justwatch_country=justwatch_country,
+        justwatch_language=justwatch_language,
+        justwatch_refresh_hours=justwatch_refresh_hours,
+        justwatch_max_results=justwatch_max_results,
+        justwatch_best_only=justwatch_best_only,
     )
