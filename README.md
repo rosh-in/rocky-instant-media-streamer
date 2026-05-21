@@ -26,7 +26,7 @@ The full pipeline runs as a single `sync_watchlist.py` invocation and can be sch
 
 ## Media Stack
 
-Four Docker containers managed by Compose:
+Five Docker containers managed by Compose:
 
 | Service | Purpose | Default Port |
 |---|---|---|
@@ -34,6 +34,7 @@ Four Docker containers managed by Compose:
 | Radarr | Movie monitoring & automation | 7878 |
 | qBittorrent | Download client | 8080 |
 | Jellyfin | Media server / playback | 8096 |
+| Bazarr | Automatic subtitles | 6767 |
 
 ## Prerequisites
 
@@ -75,8 +76,9 @@ Verify the services are healthy:
 - Radarr: http://localhost:7878
 - qBittorrent: http://localhost:8080
 - Jellyfin: http://localhost:8096
+- Bazarr: http://localhost:6767
 
-Wire the services together through their UIs (Prowlarr → Radarr → qBittorrent). See the [Servarr wiki](https://wiki.servarr.com/) for guidance.
+Wire the services together through their UIs (Prowlarr → Radarr → qBittorrent, Bazarr → Radarr). See the [Servarr wiki](https://wiki.servarr.com/) for guidance.
 
 ### 3. Set up the Python environment
 
@@ -166,7 +168,7 @@ project toto/
 │   ├── project_toto.db       # sqlite database (gitignored)
 │   └── logs/                 # application logs (gitignored)
 ├── mediaserver/
-│   ├── docker-compose.yml    # prowlarr, radarr, qbittorrent, jellyfin
+│   ├── docker-compose.yml    # prowlarr, radarr, qbittorrent, jellyfin, bazarr
 │   ├── config/               # per-service config volumes (gitignored)
 │   └── data/                 # media + torrent data (gitignored)
 ├── scripts/
