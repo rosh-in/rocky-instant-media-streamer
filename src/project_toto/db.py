@@ -53,6 +53,9 @@ class Database:
                     tmdb_release_year INTEGER,
                     tmdb_overview TEXT,
                     tmdb_popularity REAL,
+                    requested_in_radarr INTEGER NOT NULL DEFAULT 0,
+                    requested_in_radarr_at TEXT,
+                    radarr_movie_id INTEGER,
                     first_seen_watchlist_at TEXT NOT NULL,
                     last_seen_watchlist_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -66,11 +69,28 @@ class Database:
                     status TEXT NOT NULL,
                     items_seen INTEGER NOT NULL DEFAULT 0,
                     items_enriched INTEGER NOT NULL DEFAULT 0,
+                    items_requested INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT
                 );
                 """
             )
+            self._ensure_column(conn, "movies", "requested_in_radarr", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "movies", "requested_in_radarr_at", "TEXT")
+            self._ensure_column(conn, "movies", "radarr_movie_id", "INTEGER")
+            self._ensure_column(conn, "sync_runs", "items_requested", "INTEGER NOT NULL DEFAULT 0")
             conn.commit()
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column_name: str,
+        column_def: str,
+    ) -> None:
+        columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {row["name"] for row in columns}
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}")
 
     def start_sync_run(self) -> int:
         started_at = utc_now()
@@ -91,6 +111,7 @@ class Database:
         status: str,
         items_seen: int,
         items_enriched: int,
+        items_requested: int,
         error_message: Optional[str] = None,
     ) -> None:
         with self._connect() as conn:
@@ -101,14 +122,15 @@ class Database:
                     status = ?,
                     items_seen = ?,
                     items_enriched = ?,
+                    items_requested = ?,
                     error_message = ?
                 WHERE id = ?
                 """,
-                (utc_now(), status, items_seen, items_enriched, error_message, run_id),
+                (utc_now(), status, items_seen, items_enriched, items_requested, error_message, run_id),
             )
             conn.commit()
 
-    def upsert_movie(self, movie: WatchlistMovie, tmdb: Optional[TmdbMovie]) -> None:
+    def upsert_movie(self, movie: WatchlistMovie, tmdb: Optional[TmdbMovie]) -> int:
         now = utc_now()
         with self._connect() as conn:
             existing = conn.execute(
@@ -154,8 +176,9 @@ class Database:
                         existing["id"],
                     ),
                 )
+                movie_id = int(existing["id"])
             else:
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT INTO movies (
                         letterboxd_slug,
@@ -168,11 +191,14 @@ class Database:
                         tmdb_release_year,
                         tmdb_overview,
                         tmdb_popularity,
+                        requested_in_radarr,
+                        requested_in_radarr_at,
+                        radarr_movie_id,
                         first_seen_watchlist_at,
                         last_seen_watchlist_at,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         movie.letterboxd_slug,
@@ -185,10 +211,43 @@ class Database:
                         tmdb.release_year if tmdb else None,
                         tmdb.overview if tmdb else None,
                         tmdb.popularity if tmdb else None,
+                        0,
+                        None,
+                        None,
                         now,
                         now,
                         now,
                         now,
                     ),
                 )
+                movie_id = int(cursor.lastrowid)
+            conn.commit()
+            return movie_id
+
+    def list_unrequested_movies(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, title, year, tmdb_id
+                FROM movies
+                WHERE tmdb_id IS NOT NULL
+                  AND requested_in_radarr = 0
+                ORDER BY first_seen_watchlist_at ASC
+                """
+            ).fetchall()
+
+    def mark_requested_in_radarr(self, movie_id: int, radarr_movie_id: Optional[int]) -> None:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE movies
+                SET requested_in_radarr = 1,
+                    requested_in_radarr_at = ?,
+                    radarr_movie_id = COALESCE(?, radarr_movie_id),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, radarr_movie_id, now, movie_id),
+            )
             conn.commit()
