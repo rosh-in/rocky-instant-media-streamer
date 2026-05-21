@@ -123,6 +123,18 @@ rm ~/Library/LaunchAgents/dev.toto.sync.plist
 
 See `scripts/README.md` for more scheduling details.
 
+### Jellyfin playback control
+
+List active devices, search the library, or play a movie on a specific device:
+
+```sh
+python scripts/play.py devices                        # list active devices
+python scripts/play.py search "inception"              # search movie library
+python scripts/play.py start "inception" "bravia"      # play on TV (partial device name match)
+```
+
+Requires `JELLYFIN_API_KEY` and `JELLYFIN_USERNAME` in `.env`. Generate an API key in Jellyfin → Dashboard → API Keys.
+
 ## Configuration Reference
 
 All configuration is done through environment variables (`.env` file):
@@ -142,6 +154,11 @@ All configuration is done through environment variables (`.env` file):
 - `RADARR_MONITORED` — Monitor added movies (default: `true`).
 - `RADARR_SEARCH_ON_ADD` — Search immediately on add (default: `false`).
 - `RADARR_DRY_RUN` — Log what would be added without pushing (default: `true`).
+
+**Jellyfin**
+- `JELLYFIN_URL` — Jellyfin server URL (default: `http://localhost:8096`).
+- `JELLYFIN_API_KEY` — API key from Jellyfin dashboard (required for playback control).
+- `JELLYFIN_USERNAME` — Jellyfin username for session/device resolution.
 
 **JustWatch**
 - `JUSTWATCH_ENABLED` — Enable availability lookups (default: `true`).
@@ -174,6 +191,7 @@ project toto/
 ├── scripts/
 │   ├── sync_watchlist.py     # main sync entrypoint
 │   ├── status.py             # sync run health checker
+│   ├── play.py               # jellyfin playback control
 │   ├── dev.toto.sync.plist   # macOS launchd schedule
 │   └── README.md             # script + scheduling docs
 └── src/project_toto/
@@ -184,6 +202,7 @@ project toto/
     ├── justwatch.py          # OTT availability via JustWatch GraphQL
     ├── radarr.py             # Radarr API client
     ├── sync.py               # pipeline orchestration
+    ├── jellyfin.py           # Jellyfin playback client
     └── logging_config.py     # structured logging setup
 ```
 
