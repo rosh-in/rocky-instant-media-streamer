@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 
 from typing import List, Optional, Set
 from urllib.parse import urljoin
@@ -16,6 +17,18 @@ def _parse_year(text: str) -> Optional[int]:
     if len(text) == 4 and text.isdigit():
         return int(text)
     return None
+
+
+def _split_title_and_year(name: str) -> tuple[str, Optional[int]]:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return "", None
+    match = re.search(r"\((\d{4})\)\s*$", cleaned)
+    if not match:
+        return cleaned, None
+    year = int(match.group(1))
+    title = cleaned[: match.start()].strip()
+    return title, year
 
 
 def fetch_watchlist(username: str, max_pages: int = 5) -> List[WatchlistMovie]:
@@ -43,46 +56,74 @@ def fetch_watchlist(username: str, max_pages: int = 5) -> List[WatchlistMovie]:
 
         soup = BeautifulSoup(response.text, "html.parser")
         poster_items = soup.select("li.poster-container")
-        if not poster_items:
+        grid_items = soup.select("li.griditem div.react-component[data-component-class='LazyPoster']")
+        if not poster_items and not grid_items:
             break
 
-        for item in poster_items:
-            div = item.select_one("div.film-poster")
-            if not div:
-                continue
+        if poster_items:
+            for item in poster_items:
+                div = item.select_one("div.film-poster")
+                if not div:
+                    continue
 
-            slug = div.get("data-film-slug")
-            film_id = div.get("data-film-id")
-            link_el = item.select_one("div.film-poster a")
-            title_el = item.select_one("img.image")
-            year_el = item.select_one("p.poster-viewingdata")
+                slug = div.get("data-film-slug")
+                film_id = div.get("data-film-id")
+                link_el = item.select_one("div.film-poster a")
+                title_el = item.select_one("img.image")
+                year_el = item.select_one("p.poster-viewingdata")
 
-            title = ""
-            if title_el and title_el.get("alt"):
-                title = title_el.get("alt", "").strip()
-            if not title and link_el and link_el.get("href"):
-                title = link_el.get("href", "").strip("/").split("/")[-1].replace("-", " ").title()
-            if not title:
-                continue
+                title = ""
+                if title_el and title_el.get("alt"):
+                    title = title_el.get("alt", "").strip()
+                if not title and link_el and link_el.get("href"):
+                    title = link_el.get("href", "").strip("/").split("/")[-1].replace("-", " ").title()
+                if not title:
+                    continue
 
-            href = link_el.get("href") if link_el else ""
-            if not href:
-                continue
-            letterboxd_url = urljoin(LETTERBOXD_BASE, href)
+                href = link_el.get("href") if link_el else ""
+                if not href:
+                    continue
+                letterboxd_url = urljoin(LETTERBOXD_BASE, href)
 
-            year = _parse_year(year_el.get_text(strip=True) if year_el else "")
-            dedupe_key = slug or film_id or f"{title.lower()}::{year or 'na'}"
-            if dedupe_key in seen_keys:
-                continue
-            seen_keys.add(dedupe_key)
+                year = _parse_year(year_el.get_text(strip=True) if year_el else "")
+                dedupe_key = slug or film_id or f"{title.lower()}::{year or 'na'}"
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
 
-            movies.append(
-                WatchlistMovie(
-                    title=title,
-                    year=year,
-                    letterboxd_slug=slug,
-                    letterboxd_url=letterboxd_url,
+                movies.append(
+                    WatchlistMovie(
+                        title=title,
+                        year=year,
+                        letterboxd_slug=slug,
+                        letterboxd_url=letterboxd_url,
+                    )
                 )
-            )
+        else:
+            for item in grid_items:
+                slug = item.get("data-item-slug")
+                href = item.get("data-item-link") or ""
+                raw_name = item.get("data-item-name") or item.get("data-item-full-display-name") or ""
+                title, year = _split_title_and_year(raw_name)
+
+                if not title and slug:
+                    title = slug.replace("-", " ").title()
+                if not title or not href:
+                    continue
+
+                letterboxd_url = urljoin(LETTERBOXD_BASE, href)
+                dedupe_key = slug or f"{title.lower()}::{year or 'na'}"
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                movies.append(
+                    WatchlistMovie(
+                        title=title,
+                        year=year,
+                        letterboxd_slug=slug,
+                        letterboxd_url=letterboxd_url,
+                    )
+                )
 
     return movies
