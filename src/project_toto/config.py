@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -11,6 +12,25 @@ class Settings:
     tmdb_api_key: str
     sqlite_path: Path
     letterboxd_max_pages: int
+    radarr_enabled: bool
+    radarr_url: str
+    radarr_api_key: Optional[str]
+    radarr_root_folder: str
+    radarr_quality_profile_id: int
+    radarr_monitored: bool
+    radarr_search_on_add: bool
+    radarr_dry_run: bool
+
+
+def _as_bool(value: str, default: bool = False) -> bool:
+    cleaned = (value or "").strip().lower()
+    if cleaned == "":
+        return default
+    if cleaned in {"1", "true", "yes", "on"}:
+        return True
+    if cleaned in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
 
 
 def load_settings() -> Settings:
@@ -20,23 +40,47 @@ def load_settings() -> Settings:
     tmdb_api_key = os.getenv("TMDB_API_KEY", "").strip()
     sqlite_path = Path(os.getenv("SQLITE_PATH", "data/project_toto.db"))
     max_pages_raw = os.getenv("LETTERBOXD_MAX_PAGES", "5").strip()
+    radarr_enabled = _as_bool(os.getenv("RADARR_ENABLED", "false"), default=False)
+    radarr_url = os.getenv("RADARR_URL", "http://localhost:7878").strip().rstrip("/")
+    radarr_api_key = os.getenv("RADARR_API_KEY", "").strip() or None
+    radarr_root_folder = os.getenv("RADARR_ROOT_FOLDER", "/data/media/movies").strip()
+    radarr_quality_profile_id_raw = os.getenv("RADARR_QUALITY_PROFILE_ID", "1").strip()
+    radarr_monitored = _as_bool(os.getenv("RADARR_MONITORED", "true"), default=True)
+    radarr_search_on_add = _as_bool(os.getenv("RADARR_SEARCH_ON_ADD", "false"), default=False)
+    radarr_dry_run = _as_bool(os.getenv("RADARR_DRY_RUN", "true"), default=True)
 
     if not username:
         raise ValueError("Missing LETTERBOXD_USERNAME in environment.")
     if not tmdb_api_key:
         raise ValueError("Missing TMDB_API_KEY in environment.")
+    if radarr_enabled and not radarr_api_key:
+        raise ValueError("RADARR_ENABLED is true but RADARR_API_KEY is missing.")
 
     try:
         max_pages = int(max_pages_raw)
     except ValueError as exc:
         raise ValueError("LETTERBOXD_MAX_PAGES must be an integer.") from exc
+    try:
+        radarr_quality_profile_id = int(radarr_quality_profile_id_raw)
+    except ValueError as exc:
+        raise ValueError("RADARR_QUALITY_PROFILE_ID must be an integer.") from exc
 
     if max_pages < 1:
         raise ValueError("LETTERBOXD_MAX_PAGES must be >= 1.")
+    if radarr_quality_profile_id < 1:
+        raise ValueError("RADARR_QUALITY_PROFILE_ID must be >= 1.")
 
     return Settings(
         letterboxd_username=username,
         tmdb_api_key=tmdb_api_key,
         sqlite_path=sqlite_path,
         letterboxd_max_pages=max_pages,
+        radarr_enabled=radarr_enabled,
+        radarr_url=radarr_url,
+        radarr_api_key=radarr_api_key,
+        radarr_root_folder=radarr_root_folder,
+        radarr_quality_profile_id=radarr_quality_profile_id,
+        radarr_monitored=radarr_monitored,
+        radarr_search_on_add=radarr_search_on_add,
+        radarr_dry_run=radarr_dry_run,
     )
