@@ -26,6 +26,9 @@ class Settings:
     justwatch_refresh_hours: int
     justwatch_max_results: int
     justwatch_best_only: bool
+    jellyfin_url: str
+    jellyfin_api_key: Optional[str]
+    jellyfin_username: str
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -60,6 +63,9 @@ def load_settings() -> Settings:
     justwatch_refresh_hours_raw = os.getenv("JUSTWATCH_REFRESH_HOURS", "168").strip()
     justwatch_max_results_raw = os.getenv("JUSTWATCH_MAX_RESULTS", "3").strip()
     justwatch_best_only = _as_bool(os.getenv("JUSTWATCH_BEST_ONLY", "true"), default=True)
+    jellyfin_url = os.getenv("JELLYFIN_URL", "http://localhost:8096").strip().rstrip("/")
+    jellyfin_api_key = os.getenv("JELLYFIN_API_KEY", "").strip() or None
+    jellyfin_username = os.getenv("JELLYFIN_USERNAME", "").strip()
 
     if not username:
         raise ValueError("Missing LETTERBOXD_USERNAME in environment.")
@@ -115,4 +121,7 @@ def load_settings() -> Settings:
         justwatch_refresh_hours=justwatch_refresh_hours,
         justwatch_max_results=justwatch_max_results,
         justwatch_best_only=justwatch_best_only,
+        jellyfin_url=jellyfin_url,
+        jellyfin_api_key=jellyfin_api_key,
+        jellyfin_username=jellyfin_username,
     )
