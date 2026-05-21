@@ -27,6 +27,14 @@ class TmdbMovie:
     popularity: float
 
 
+@dataclass(frozen=True)
+class AvailabilityOffer:
+    provider_name: str
+    provider_code: Optional[str]
+    monetization_type: str
+    url: Optional[str]
+
+
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -53,6 +61,7 @@ class Database:
                     tmdb_release_year INTEGER,
                     tmdb_overview TEXT,
                     tmdb_popularity REAL,
+                    availability_last_checked_at TEXT,
                     requested_in_radarr INTEGER NOT NULL DEFAULT 0,
                     requested_in_radarr_at TEXT,
                     radarr_movie_id INTEGER,
@@ -69,14 +78,43 @@ class Database:
                     status TEXT NOT NULL,
                     items_seen INTEGER NOT NULL DEFAULT 0,
                     items_enriched INTEGER NOT NULL DEFAULT 0,
+                    items_availability_refreshed INTEGER NOT NULL DEFAULT 0,
                     items_requested INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS availability (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    movie_id INTEGER NOT NULL,
+                    country_code TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    provider_code TEXT,
+                    monetization_type TEXT NOT NULL,
+                    url TEXT,
+                    retrieved_at TEXT NOT NULL,
+                    FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE
+                );
                 """
             )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_availability_unique_offer
+                ON availability (movie_id, country_code, provider_name, monetization_type, COALESCE(url, ''))
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_availability_movie
+                ON availability (movie_id, country_code)
+                """
+            )
+            self._ensure_column(conn, "movies", "availability_last_checked_at", "TEXT")
             self._ensure_column(conn, "movies", "requested_in_radarr", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "movies", "requested_in_radarr_at", "TEXT")
             self._ensure_column(conn, "movies", "radarr_movie_id", "INTEGER")
+            self._ensure_column(
+                conn, "sync_runs", "items_availability_refreshed", "INTEGER NOT NULL DEFAULT 0"
+            )
             self._ensure_column(conn, "sync_runs", "items_requested", "INTEGER NOT NULL DEFAULT 0")
             conn.commit()
 
@@ -111,6 +149,7 @@ class Database:
         status: str,
         items_seen: int,
         items_enriched: int,
+        items_availability_refreshed: int,
         items_requested: int,
         error_message: Optional[str] = None,
     ) -> None:
@@ -122,11 +161,21 @@ class Database:
                     status = ?,
                     items_seen = ?,
                     items_enriched = ?,
+                    items_availability_refreshed = ?,
                     items_requested = ?,
                     error_message = ?
                 WHERE id = ?
                 """,
-                (utc_now(), status, items_seen, items_enriched, items_requested, error_message, run_id),
+                (
+                    utc_now(),
+                    status,
+                    items_seen,
+                    items_enriched,
+                    items_availability_refreshed,
+                    items_requested,
+                    error_message,
+                    run_id,
+                ),
             )
             conn.commit()
 
@@ -249,5 +298,71 @@ class Database:
                 WHERE id = ?
                 """,
                 (now, radarr_movie_id, now, movie_id),
+            )
+            conn.commit()
+
+    def list_movies_for_availability_refresh(self, stale_before_iso: str) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, title, year
+                FROM movies
+                WHERE tmdb_id IS NOT NULL
+                  AND (
+                        availability_last_checked_at IS NULL
+                        OR availability_last_checked_at < ?
+                  )
+                ORDER BY first_seen_watchlist_at ASC
+                """,
+                (stale_before_iso,),
+            ).fetchall()
+
+    def replace_movie_availability(
+        self,
+        movie_id: int,
+        country_code: str,
+        offers: list[AvailabilityOffer],
+    ) -> None:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM availability
+                WHERE movie_id = ?
+                  AND country_code = ?
+                """,
+                (movie_id, country_code.upper()),
+            )
+            for offer in offers:
+                conn.execute(
+                    """
+                    INSERT INTO availability (
+                        movie_id,
+                        country_code,
+                        provider_name,
+                        provider_code,
+                        monetization_type,
+                        url,
+                        retrieved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        movie_id,
+                        country_code.upper(),
+                        offer.provider_name,
+                        offer.provider_code,
+                        offer.monetization_type,
+                        offer.url,
+                        now,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE movies
+                SET availability_last_checked_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, movie_id),
             )
             conn.commit()
