@@ -1,7 +1,9 @@
 from __future__ import annotations
+from datetime import datetime, timedelta, timezone
 
 from project_toto.config import load_settings
 from project_toto.db import Database
+from project_toto.justwatch import JustWatchClient
 from project_toto.letterboxd import fetch_watchlist
 from project_toto.radarr import RadarrClient
 from project_toto.tmdb import TmdbClient
@@ -15,6 +17,7 @@ def run_watchlist_sync() -> None:
 
     seen = 0
     enriched = 0
+    availability_refreshed = 0
     requested = 0
     try:
         watchlist = fetch_watchlist(
@@ -29,6 +32,33 @@ def run_watchlist_sync() -> None:
             if tmdb_movie:
                 enriched += 1
             db.upsert_movie(movie, tmdb_movie)
+
+        if settings.justwatch_enabled:
+            justwatch = JustWatchClient(
+                country=settings.justwatch_country,
+                language=settings.justwatch_language,
+                max_results=settings.justwatch_max_results,
+                best_only=settings.justwatch_best_only,
+            )
+            stale_before = (
+                datetime.now(timezone.utc) - timedelta(hours=settings.justwatch_refresh_hours)
+            ).isoformat()
+            availability_targets = db.list_movies_for_availability_refresh(stale_before_iso=stale_before)
+
+            for row in availability_targets:
+                try:
+                    offers = justwatch.lookup_movie_availability(
+                        title=str(row["title"]),
+                        year=row["year"],
+                    )
+                    db.replace_movie_availability(
+                        movie_id=int(row["id"]),
+                        country_code=settings.justwatch_country,
+                        offers=offers,
+                    )
+                    availability_refreshed += 1
+                except Exception as exc:
+                    print(f"JustWatch refresh failed for {row['title']}: {exc}")
         if settings.radarr_enabled and settings.radarr_api_key:
             radarr = RadarrClient(
                 base_url=settings.radarr_url,
@@ -59,11 +89,14 @@ def run_watchlist_sync() -> None:
             status="success",
             items_seen=seen,
             items_enriched=enriched,
+            items_availability_refreshed=availability_refreshed,
             items_requested=requested,
         )
         print(
             "Sync complete. "
-            f"Seen={seen}, Enriched={enriched}, Requested={requested}, DB={settings.sqlite_path}"
+            "AvailabilityRefreshed="
+            f"{availability_refreshed}, Seen={seen}, Enriched={enriched}, Requested={requested}, "
+            f"DB={settings.sqlite_path}"
         )
     except Exception as exc:
         db.finish_sync_run(
@@ -71,6 +104,7 @@ def run_watchlist_sync() -> None:
             status="failed",
             items_seen=seen,
             items_enriched=enriched,
+            items_availability_refreshed=availability_refreshed,
             items_requested=requested,
             error_message=str(exc),
         )
