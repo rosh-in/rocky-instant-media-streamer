@@ -1,0 +1,36 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+mediaserver/.env
+mediaserver/.env.*
+!mediaserver/.env.example
+*.pem
+*.key
+*.crt
+*.p12
+token.json
+
+# Local service state/data (do not commit)
+mediaserver/config/
+mediaserver/data/
+
+# Databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Docker local overrides
+docker-compose.override.yml
