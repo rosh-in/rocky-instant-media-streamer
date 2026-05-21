@@ -20,6 +20,7 @@ mediaserver/data/
 *.sqlite
 *.sqlite3
 *.log
+data/logs/
 
 # Python
 __pycache__/
@@ -34,3 +35,6 @@ venv/
 
 # Docker local overrides
 docker-compose.override.yml
+
+# Local planning docs
+ROADMAP.md
