@@ -1,19 +1,26 @@
 from __future__ import annotations
+
+import logging
 from datetime import datetime, timedelta, timezone
 
 from project_toto.config import load_settings
 from project_toto.db import Database
 from project_toto.justwatch import JustWatchClient
 from project_toto.letterboxd import fetch_watchlist
+from project_toto.logging_config import setup_logging
 from project_toto.radarr import RadarrClient
 from project_toto.tmdb import TmdbClient
 
+logger = logging.getLogger("project_toto.sync")
+
 
 def run_watchlist_sync() -> None:
+    setup_logging()
     settings = load_settings()
     db = Database(settings.sqlite_path)
     db.init_schema()
     run_id = db.start_sync_run()
+    logger.info("Sync run #%d started", run_id)
 
     seen = 0
     enriched = 0
@@ -58,7 +65,7 @@ def run_watchlist_sync() -> None:
                     )
                     availability_refreshed += 1
                 except Exception as exc:
-                    print(f"JustWatch refresh failed for {row['title']}: {exc}")
+                    logger.warning("JustWatch refresh failed for %s: %s", row['title'], exc)
         if settings.radarr_enabled and settings.radarr_api_key:
             radarr = RadarrClient(
                 base_url=settings.radarr_url,
@@ -71,7 +78,7 @@ def run_watchlist_sync() -> None:
             pending = db.list_unrequested_movies()
             if settings.radarr_dry_run:
                 requested = len(pending)
-                print(f"Radarr dry-run enabled. Would request {requested} movie(s).")
+                logger.info("Radarr dry-run enabled. Would request %d movie(s).", requested)
             else:
                 for row in pending:
                     try:
@@ -79,9 +86,9 @@ def run_watchlist_sync() -> None:
                         db.mark_requested_in_radarr(movie_id=int(row["id"]), radarr_movie_id=radarr_movie_id)
                         requested += 1
                     except Exception as exc:
-                        print(
-                            "Radarr add failed for "
-                            f"{row['title']} (tmdb={row['tmdb_id']}): {exc}"
+                        logger.warning(
+                            "Radarr add failed for %s (tmdb=%s): %s",
+                            row['title'], row['tmdb_id'], exc,
                         )
 
         db.finish_sync_run(
@@ -92,11 +99,9 @@ def run_watchlist_sync() -> None:
             items_availability_refreshed=availability_refreshed,
             items_requested=requested,
         )
-        print(
-            "Sync complete. "
-            "AvailabilityRefreshed="
-            f"{availability_refreshed}, Seen={seen}, Enriched={enriched}, Requested={requested}, "
-            f"DB={settings.sqlite_path}"
+        logger.info(
+            "Sync complete. Seen=%d, Enriched=%d, AvailabilityRefreshed=%d, Requested=%d, DB=%s",
+            seen, enriched, availability_refreshed, requested, settings.sqlite_path,
         )
     except Exception as exc:
         db.finish_sync_run(
