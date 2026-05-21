@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
 from project_toto.db import TmdbMovie, WatchlistMovie
+
+logger = logging.getLogger("project_toto.tmdb")
 
 
 class TmdbClient:
@@ -13,6 +17,13 @@ class TmdbClient:
         self.session = requests.Session()
         self.base_url = "https://api.themoviedb.org/3"
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     def _search_movie(self, title: str, year: Optional[int]) -> Dict[str, Any]:
         params = {
             "api_key": self.api_key,

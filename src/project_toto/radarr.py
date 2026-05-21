@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+
+logger = logging.getLogger("project_toto.radarr")
 
 
 class RadarrClient:
@@ -29,11 +33,25 @@ class RadarrClient:
             }
         )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     def _get(self, path: str, **kwargs: Any) -> requests.Response:
         response = self.session.get(f"{self.base_url}{path}", timeout=30, **kwargs)
         response.raise_for_status()
         return response
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     def _post(self, path: str, **kwargs: Any) -> requests.Response:
         response = self.session.post(f"{self.base_url}{path}", timeout=30, **kwargs)
         response.raise_for_status()

@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import logging
 import re
 
 from typing import List, Optional, Set
@@ -6,8 +8,11 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
 from project_toto.db import WatchlistMovie
+
+logger = logging.getLogger("project_toto.letterboxd")
 
 LETTERBOXD_BASE = "https://letterboxd.com"
 
@@ -44,12 +49,22 @@ def fetch_watchlist(username: str, max_pages: int = 5) -> List[WatchlistMovie]:
         }
     )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _fetch_page(page_url: str) -> requests.Response:
+        return session.get(page_url, timeout=20)
+
     for page in range(1, max_pages + 1):
         url = f"{LETTERBOXD_BASE}/{username}/watchlist/"
         if page > 1:
             url = f"{LETTERBOXD_BASE}/{username}/watchlist/page/{page}/"
 
-        response = session.get(url, timeout=20)
+        response = _fetch_page(url)
         if response.status_code == 404 and page == 1:
             raise ValueError(f"Letterboxd watchlist not found for user: {username}")
         response.raise_for_status()

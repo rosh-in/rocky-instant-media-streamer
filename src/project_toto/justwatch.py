@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
 from project_toto.db import AvailabilityOffer
+
+logger = logging.getLogger("project_toto.justwatch")
 
 JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql"
 
@@ -85,6 +89,13 @@ class JustWatchClient:
             "query": _SEARCH_QUERY,
         }
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     def _fetch_nodes(self, title: str, year: Optional[int]) -> list[dict[str, Any]]:
         payload = self._request_payload(title=title, year=year)
         response = self.session.post(JUSTWATCH_GRAPHQL_URL, json=payload, timeout=40)
