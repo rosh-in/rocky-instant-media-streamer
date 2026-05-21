@@ -66,6 +66,22 @@ services:
     networks:
       - media_net
 
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ./config/bazarr:/config
+      - ./data/media/movies:/movies
+    ports:
+      - "${BAZARR_PORT}:6767"
+    restart: unless-stopped
+    networks:
+      - media_net
+
 networks:
   media_net:
     driver: bridge
