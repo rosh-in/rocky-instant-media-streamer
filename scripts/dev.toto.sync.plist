@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.toto.sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- UPDATE this path to your venv's python -->
+        <string>/Users/roshin/project toto/.venv/bin/python</string>
+        <string>scripts/sync_watchlist.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/roshin/project toto</string>
+
+    <!-- Run once every 24 hours (86400 seconds) -->
+    <key>StartInterval</key>
+    <integer>86400</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/roshin/project toto/data/logs/launchd_sync.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/roshin/project toto/data/logs/launchd_sync.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
