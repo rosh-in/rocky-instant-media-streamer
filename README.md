@@ -191,6 +191,8 @@ project toto/
 - [x] Phase 1 — Watchlist parsing + TMDB enrichment + Radarr sync
 - [x] Phase 2 — OTT availability via JustWatch
 - [x] Phase 3 — Automation & reliability (logging, retries, scheduling, status CLI)
-- [ ] Phase 4 — Telegram bot for recommendations and playback
-- [ ] Phase 5 — Optional Raspberry Pi migration
-- [ ] Phase 6 — Polish and public release
+- [ ] Phase 4 — Bazarr + subtitle automation
+- [ ] Phase 5 — Jellyfin multi-device playback control
+- [ ] Phase 6 — Telegram bot + Gemini-powered recommendations
+- [ ] Phase 7 — Optional Raspberry Pi migration
+- [ ] Phase 8 — Polish and public release
