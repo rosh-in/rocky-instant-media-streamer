@@ -66,6 +66,17 @@ services:
     networks:
       - media_net
 
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "${FLARESOLVERR_PORT}:8191"
+    restart: unless-stopped
+    networks:
+      - media_net
+
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
     container_name: bazarr
