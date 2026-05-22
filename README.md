@@ -135,6 +135,22 @@ python scripts/play.py start "inception" "bravia"      # play on TV (partial dev
 
 Requires `JELLYFIN_API_KEY` and `JELLYFIN_USERNAME` in `.env`. Generate an API key in Jellyfin → Dashboard → API Keys.
 
+### Telegram bot
+
+Chat-based movie recommendations powered by Gemini, with Jellyfin playback control:
+
+```sh
+python -m project_toto.bot
+```
+
+Commands:
+- `/recommend <mood>` — Get 2-3 mood-based movie picks from your watchlist
+- `/play <title>` — Search Jellyfin and pick a device (inline keyboard)
+- `/devices` — List active Jellyfin devices
+- `/status` — Show last sync run and library stats
+
+Requires `TELEGRAM_BOT_TOKEN` (from @BotFather) and `GEMINI_API_KEY` in `.env`.
+
 ## Configuration Reference
 
 All configuration is done through environment variables (`.env` file):
@@ -167,6 +183,10 @@ All configuration is done through environment variables (`.env` file):
 - `JUSTWATCH_REFRESH_HOURS` — Re-check availability after N hours (default: `168`).
 - `JUSTWATCH_MAX_RESULTS` — Max results per lookup (default: `3`).
 - `JUSTWATCH_BEST_ONLY` — Only best offers per provider (default: `true`).
+
+**Telegram Bot / Gemini**
+- `TELEGRAM_BOT_TOKEN` — Bot token from @BotFather (required for bot).
+- `GEMINI_API_KEY` — Google Gemini API key (required for recommendations).
 
 ## Logging
 
@@ -203,6 +223,8 @@ project toto/
     ├── radarr.py             # Radarr API client
     ├── sync.py               # pipeline orchestration
     ├── jellyfin.py           # Jellyfin playback client
+    ├── gemini.py             # Gemini recommendation engine
+    ├── bot.py                # Telegram bot
     └── logging_config.py     # structured logging setup
 ```
 
@@ -213,7 +235,7 @@ project toto/
 - [x] Phase 2 — OTT availability via JustWatch
 - [x] Phase 3 — Automation & reliability (logging, retries, scheduling, status CLI)
 - [ ] Phase 4 — Bazarr + subtitle automation
-- [ ] Phase 5 — Jellyfin multi-device playback control
+- [x] Phase 5 — Jellyfin multi-device playback control
 - [ ] Phase 6 — Telegram bot + Gemini-powered recommendations
 - [ ] Phase 7 — Optional Raspberry Pi migration
 - [ ] Phase 8 — Polish and public release
