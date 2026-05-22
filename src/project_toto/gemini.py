@@ -1,173 +1,209 @@
-"""Gemini-powered movie recommendation engine with SQLite context injection."""
+"""Gemini-powered movie concierge with tool use and conversation memory."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Optional
 
 import google.generativeai as genai
 
 from project_toto.db import Database
+from project_toto.jellyfin import JellyfinClient
 
 logger = logging.getLogger("project_toto.gemini")
 
 SYSTEM_PROMPT = """\
-You are a movie recommendation assistant for a personal home media system.
+You are a personal movie concierge for a home media system. You help the user \
+discover and watch movies from their Letterboxd watchlist.
 
-You have access to the user's Letterboxd watchlist (movies they want to watch) \
-and OTT availability data (which streaming platforms carry each title). Your \
-job is to suggest movies from their watchlist that match their current mood.
+You have tools to look up their watchlist, search their Jellyfin library, \
+check streaming availability, see active devices, and play movies.
 
-Rules:
-- Recommend 2-3 movies from the provided watchlist that best match the mood.
-- For each recommendation, give a 1-2 sentence reason tied to the mood.
-- If a movie is available on an OTT platform, mention it (e.g., "Streaming on Netflix").
-- If no watchlist movies match the mood well, say so honestly and suggest \
-broadening the mood or picking something adjacent.
-- Keep responses concise and formatted for a Telegram chat.
+Guidelines:
+- Only recommend movies from the user's watchlist — never suggest movies not in the list.
+- Be brief and decisive. One-sentence reasons for recommendations.
+- Ask a quick clarifying question only if the request is too vague to make a good pick.
+- Remember constraints mentioned earlier in the conversation (e.g., "under 90 minutes", "not horror").
+- If the user seems indecisive, offer to just pick something for them.
+- When you recommend a movie, mention if it's available locally (Jellyfin) or on a streaming platform (OTT).
+- If the user wants to play something, use the play_movie tool. If they specify a device \
+(like "on my TV" or "on chrome"), pass it as device_name. If they don't specify a device, \
+leave device_name empty — the system will show device buttons for them to pick.
+- You can be warm and conversational, but get to the point quickly.
 """
 
 
-@dataclass(frozen=True)
-class Recommendation:
-    title: str
-    year: Optional[int]
-    reason: str
-    ott_platform: Optional[str]
+class MovieConcierge:
+    """Conversational movie concierge powered by Gemini with tool use."""
 
-
-def _build_context(db: Database, country_code: str = "IN") -> str:
-    """Build a context string from SQLite with watchlist + OTT availability."""
-    with db._connect() as conn:
-        movies = conn.execute(
-            """
-            SELECT m.title, m.year, m.tmdb_overview, m.tmdb_popularity,
-                   GROUP_CONCAT(
-                       a.provider_name || '(' || a.monetization_type || ')',
-                       ', '
-                   ) AS availability
-            FROM movies m
-            LEFT JOIN availability a
-                ON a.movie_id = m.id AND a.country_code = ?
-            WHERE m.tmdb_id IS NOT NULL
-            GROUP BY m.id
-            ORDER BY m.tmdb_popularity DESC
-            LIMIT 50
-            """,
-            (country_code.upper(),),
-        ).fetchall()
-
-    if not movies:
-        return "No movies in the watchlist yet."
-
-    lines = ["## Watchlist Movies:\n"]
-    for row in movies:
-        year_str = f" ({row['year']})" if row["year"] else ""
-        overview = (row["tmdb_overview"] or "")[:120]
-        avail = row["availability"] or "Not on OTT"
-        lines.append(f"- **{row['title']}{year_str}** — {overview} | OTT: {avail}")
-
-    return "\n".join(lines)
-
-
-def recommend(
-    api_key: str,
-    db: Database,
-    mood: str,
-    country_code: str = "IN",
-) -> list[Recommendation]:
-    """Get mood-based movie recommendations from Gemini.
-
-    Returns a list of Recommendation objects parsed from the Gemini response.
-    """
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-model_name="gemini-2.5-flash",
-        system_instruction=SYSTEM_PROMPT,
-    )
-
-    context = _build_context(db, country_code)
-
-    prompt = f"""\
-{context}
-
----
-
-The user's mood right now: **{mood}**
-
-Based on the watchlist above, recommend 2-3 movies that match this mood. \
-For each movie, provide:
-- Title and year
-- A brief reason (1-2 sentences) tied to the mood
-- OTT availability if listed
-
-Format each recommendation as:
-TITLE: <title> (<year>)
-REASON: <reason>
-OTT: <platform or "Local library">
----
-"""
-    response = model.generate_content(prompt)
-    text = response.text
-
-    # Parse structured recommendations from the response
-    recommendations: list[Recommendation] = []
-    blocks = text.split("---")
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        title = None
-        year = None
-        reason = None
-        ott = None
-        for line in block.splitlines():
-            line = line.strip()
-            if line.upper().startswith("TITLE:"):
-                raw = line[len("TITLE:"):].strip()
-                # Extract year from parentheses, e.g. "Inception (2010)"
-                if "(" in raw and ")" in raw:
-                    year_str = raw[raw.rindex("(") + 1 : raw.rindex(")")]
-                    try:
-                        year = int(year_str)
-                    except ValueError:
-                        pass
-                    raw = raw[: raw.rindex("(")].strip()
-                title = raw
-            elif line.upper().startswith("REASON:"):
-                reason = line[len("REASON:"):].strip()
-            elif line.upper().startswith("OTT:"):
-                ott = line[len("OTT:"):].strip()
-        if title:
-            recommendations.append(
-                Recommendation(
-                    title=title,
-                    year=year,
-                    reason=reason or "Matches your mood.",
-                    ott_platform=ott,
-                )
-            )
-
-    # If parsing failed, return a single raw-text recommendation
-    if not recommendations and text.strip():
-        recommendations.append(
-            Recommendation(title="(see full response)", year=None, reason=text.strip()[:500], ott_platform=None)
+    def __init__(
+        self,
+        gemini_api_key: str,
+        db_path: str,
+        jellyfin_url: str,
+        jellyfin_api_key: str,
+        jellyfin_username: str,
+        country_code: str = "IN",
+    ):
+        self.db = Database(db_path)
+        self.db.init_schema()
+        self.jellyfin = JellyfinClient(
+            base_url=jellyfin_url,
+            api_key=jellyfin_api_key,
+            username=jellyfin_username,
         )
+        self.country_code = country_code.upper()
 
-    logger.info("Gemini returned %d recommendations for mood '%s'", len(recommendations), mood)
-    return recommendations
+        genai.configure(api_key=gemini_api_key)
+        self.model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=SYSTEM_PROMPT,
+            tools=[
+                self._get_watchlist,
+                self._search_jellyfin,
+                self._get_active_devices,
+                self._play_movie,
+                self._get_sync_status,
+            ],
+        )
+        self.chat_session = self.model.start_chat(
+            enable_automatic_function_calling=True
+        )
+        self._pending_device_picker: Optional[dict] = None
 
+    # -- Tool functions (schema inferred from signatures + docstrings) ---------
 
-def format_recommendations(recs: list[Recommendation]) -> str:
-    """Format recommendations for Telegram display."""
-    if not recs:
-        return "No recommendations found. Try a different mood!"
+    def _get_watchlist(self) -> list[dict]:
+        """Returns the user's full movie watchlist with metadata, popularity, and OTT streaming availability. Use this to find movies that match a mood or preference."""
+        with self.db._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.title, m.year, m.tmdb_overview, m.tmdb_popularity,
+                       GROUP_CONCAT(a.provider_name || '(' || a.monetization_type || ')', ', ') AS availability,
+                       m.requested_in_radarr
+                FROM movies m
+                LEFT JOIN availability a ON a.movie_id = m.id AND a.country_code = ?
+                WHERE m.tmdb_id IS NOT NULL
+                GROUP BY m.id
+                ORDER BY m.tmdb_popularity DESC
+                LIMIT 50
+                """,
+                (self.country_code,),
+            ).fetchall()
 
-    lines = []
-    for i, r in enumerate(recs, 1):
-        year_str = f" ({r.year})" if r.year else ""
-        ott_str = f"\n  📺 {r.ott_platform}" if r.ott_platform else ""
-        lines.append(f"{i}. 🎬 *{r.title}{year_str}*\n  💡 {r.reason}{ott_str}")
+        return [
+            {
+                "title": r["title"],
+                "year": r["year"],
+                "overview": (r["tmdb_overview"] or "")[:150],
+                "popularity": r["tmdb_popularity"],
+                "ott": r["availability"] or "Not on OTT",
+                "downloaded": bool(r["requested_in_radarr"]),
+            }
+            for r in rows
+        ]
 
-    return "\n\n".join(lines)
+    def _search_jellyfin(self, query: str) -> list[dict]:
+        """Search the user's Jellyfin media library for a movie by title. Returns matching movies with their Jellyfin IDs. Use this to check if a specific movie is ready to play."""
+        movies = self.jellyfin.search_movies(query, limit=5)
+        return [
+            {"name": m.name, "year": m.year, "item_id": m.item_id, "overview": m.overview}
+            for m in movies
+        ]
+
+    def _get_active_devices(self) -> list[dict]:
+        """Get the list of active Jellyfin playback devices (TVs, phones, browsers) that are currently connected and can receive play commands. Returns device names and session IDs."""
+        devices = self.jellyfin.list_devices()
+        return [
+            {"device_name": d.device_name, "client": d.client, "session_id": d.session_id}
+            for d in devices
+        ]
+
+    def _play_movie(self, title: str, device_name: str = "") -> dict:
+        """Play a movie on a Jellyfin device. Searches for the movie by title. If device_name is provided (e.g. 'chrome', 'tv', 'iphone'), plays on the best-matching device. If device_name is empty or not specified, returns available devices for the user to pick from."""
+        movies = self.jellyfin.search_movies(title, limit=5)
+        if not movies:
+            return {"error": f"No movie found for '{title}'"}
+
+        movie = movies[0]
+        devices = self.jellyfin.list_devices()
+        if not devices:
+            return {"error": "No active devices. Open Jellyfin on a device first."}
+
+        # Try to match device if specified
+        if device_name:
+            target = device_name.lower()
+            for d in devices:
+                if target in d.device_name.lower() or target in d.client.lower():
+                    self.jellyfin.play(session_id=d.session_id, item_id=movie.item_id)
+                    return {
+                        "played": True,
+                        "movie": movie.name,
+                        "year": movie.year,
+                        "device": d.label,
+                    }
+            # Device not found — fall through to show all devices
+
+        # No device matched (or none specified) — save for button selection
+        self._pending_device_picker = {
+            "movie_name": movie.name,
+            "item_id": movie.item_id,
+            "devices": [{"label": d.label, "session_id": d.session_id} for d in devices],
+        }
+
+        return {
+            "played": False,
+            "movie": movie.name,
+            "year": movie.year,
+            "available_devices": [d.label for d in devices],
+            "message": "Movie found. Awaiting device selection.",
+        }
+
+    def _get_sync_status(self) -> dict:
+        """Get the last sync run status and overall library statistics including how many movies are tracked and how many haven't been requested for download yet."""
+        with self.db._connect() as conn:
+            last_run = conn.execute(
+                "SELECT started_at, status, items_seen, items_enriched, items_availability_refreshed, items_requested "
+                "FROM sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            total = conn.execute("SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL").fetchone()[0]
+            unrequested = conn.execute("SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL AND requested_in_radarr = 0").fetchone()[0]
+
+        result = {"total_movies": total, "unrequested": unrequested}
+        if last_run:
+            result["last_sync"] = last_run["started_at"][:19]
+            result["status"] = last_run["status"]
+            result["items_seen"] = last_run["items_seen"]
+            result["items_enriched"] = last_run["items_enriched"]
+        return result
+
+    # -- Public API ------------------------------------------------------------
+
+    def chat(self, message: str) -> tuple[str, Optional[dict]]:
+        """Send a user message and get a response.
+
+        Returns (response_text, device_picker_data).
+        device_picker_data is a dict with movie info + device list when
+        play_movie was called without a specific device.
+        """
+        self._pending_device_picker = None
+
+        try:
+            response = self.chat_session.send_message(message)
+            text = response.text
+        except Exception as exc:
+            err_msg = str(exc)
+            if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
+                text = "Gemini API quota exceeded — try again in a minute."
+            else:
+                logger.exception("Gemini chat failed")
+                text = f"Something went wrong: {err_msg}"
+
+        return text, self._pending_device_picker
+
+    def reset(self) -> None:
+        """Reset the conversation history."""
+        self.chat_session = self.model.start_chat(
+            enable_automatic_function_calling=True
+        )
+        self._pending_device_picker = None
