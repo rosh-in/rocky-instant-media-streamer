@@ -29,6 +29,8 @@ class Settings:
     jellyfin_url: str
     jellyfin_api_key: Optional[str]
     jellyfin_username: str
+    telegram_bot_token: Optional[str]
+    gemini_api_key: Optional[str]
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -66,6 +68,8 @@ def load_settings() -> Settings:
     jellyfin_url = os.getenv("JELLYFIN_URL", "http://localhost:8096").strip().rstrip("/")
     jellyfin_api_key = os.getenv("JELLYFIN_API_KEY", "").strip() or None
     jellyfin_username = os.getenv("JELLYFIN_USERNAME", "").strip()
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
 
     if not username:
         raise ValueError("Missing LETTERBOXD_USERNAME in environment.")
@@ -124,4 +128,6 @@ def load_settings() -> Settings:
         jellyfin_url=jellyfin_url,
         jellyfin_api_key=jellyfin_api_key,
         jellyfin_username=jellyfin_username,
+        telegram_bot_token=telegram_bot_token,
+        gemini_api_key=gemini_api_key,
     )
