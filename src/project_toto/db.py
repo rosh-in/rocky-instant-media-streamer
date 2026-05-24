@@ -61,6 +61,9 @@ class Database:
                     tmdb_release_year INTEGER,
                     tmdb_overview TEXT,
                     tmdb_popularity REAL,
+                    poster_url TEXT,
+                    genre TEXT,
+                    runtime INTEGER,
                     availability_last_checked_at TEXT,
                     requested_in_radarr INTEGER NOT NULL DEFAULT 0,
                     requested_in_radarr_at TEXT,
@@ -112,6 +115,9 @@ class Database:
             self._ensure_column(conn, "movies", "requested_in_radarr", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "movies", "requested_in_radarr_at", "TEXT")
             self._ensure_column(conn, "movies", "radarr_movie_id", "INTEGER")
+            self._ensure_column(conn, "movies", "poster_url", "TEXT")
+            self._ensure_column(conn, "movies", "genre", "TEXT")
+            self._ensure_column(conn, "movies", "runtime", "INTEGER")
             self._ensure_column(
                 conn, "sync_runs", "items_availability_refreshed", "INTEGER NOT NULL DEFAULT 0"
             )
@@ -366,3 +372,152 @@ class Database:
                 (now, now, movie_id),
             )
             conn.commit()
+
+    def update_movie_details(
+        self,
+        movie_id: int,
+        poster_url: Optional[str],
+        genre: Optional[str],
+        runtime: Optional[int],
+    ) -> None:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE movies
+                SET poster_url = COALESCE(?, poster_url),
+                    genre = COALESCE(?, genre),
+                    runtime = COALESCE(?, runtime),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (poster_url, genre, runtime, now, movie_id),
+            )
+            conn.commit()
+
+    def get_movie_by_tmdb_id(self, tmdb_id: int, country_code: str = "IN") -> Optional[dict]:
+        """Return a movie dict with all fields needed for recommendations, or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.requested_in_radarr
+                FROM movies m
+                WHERE m.tmdb_id = ?
+                """,
+                (tmdb_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            # Check Jellyfin availability (requested_in_radarr serves as proxy)
+            in_jellyfin = bool(row["requested_in_radarr"])
+
+            # Get OTT platforms
+            ott_rows = conn.execute(
+                """
+                SELECT DISTINCT provider_name
+                FROM availability
+                WHERE movie_id = ? AND country_code = ?
+                """,
+                (row["id"], country_code.upper()),
+            ).fetchall()
+            ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+
+            return {
+                "id": row["id"],
+                "title": row["title"],
+                "year": row["year"],
+                "tmdb_id": row["tmdb_id"],
+                "poster_url": row["poster_url"],
+                "genre": row["genre"],
+                "runtime": row["runtime"],
+                "overview": row["tmdb_overview"],
+                "in_jellyfin": in_jellyfin,
+                "ott_platforms": ott_platforms,
+            }
+
+    def get_relevant_movies(
+        self,
+        keywords: str,
+        country_code: str = "IN",
+        limit: int = 20,
+        exclude_ids: Optional[list[int]] = None,
+    ) -> list[dict]:
+        """Return movies matching keywords for local pre-filtering before Gemini.
+
+        Does simple LIKE matching on title, genre, and overview.
+        Prioritises movies in Jellyfin.
+        """
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            # Build keyword conditions for title/genre/overview
+            words = keywords.lower().split()
+            if not words:
+                # No keywords — just return most popular
+                query = """
+                    SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                           m.runtime, m.tmdb_overview, m.requested_in_radarr
+                    FROM movies m
+                    WHERE m.tmdb_id IS NOT NULL
+                    ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
+                    LIMIT ?
+                """
+                rows = conn.execute(query, (limit,)).fetchall()
+            else:
+                # Build WHERE clause with OR conditions for each word
+                conditions = []
+                params: list = []
+                for w in words:
+                    like = f"%{w}%"
+                    conditions.append(
+                        "(LOWER(m.title) LIKE ? OR LOWER(m.genre) LIKE ? OR LOWER(m.tmdb_overview) LIKE ?)"
+                    )
+                    params.extend([like, like, like])
+
+                where_clause = " OR ".join(conditions)
+                exclude_clause = ""
+                if exclude:
+                    placeholders = ",".join("?" for _ in exclude)
+                    exclude_clause = f"AND m.tmdb_id NOT IN ({placeholders})"
+                    params.extend(exclude)
+
+                query = f"""
+                    SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                           m.runtime, m.tmdb_overview, m.requested_in_radarr
+                    FROM movies m
+                    WHERE m.tmdb_id IS NOT NULL
+                      AND ({where_clause})
+                      {exclude_clause}
+                    ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
+                    LIMIT ?
+                """
+                params.append(limit)
+                rows = conn.execute(query, params).fetchall()
+
+            results: list[dict] = []
+            for row in rows:
+                in_jellyfin = bool(row["requested_in_radarr"])
+                ott_rows = conn.execute(
+                    """
+                    SELECT DISTINCT provider_name
+                    FROM availability
+                    WHERE movie_id = ? AND country_code = ?
+                    """,
+                    (row["id"], country_code.upper()),
+                ).fetchall()
+                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "tmdb_id": row["tmdb_id"],
+                    "poster_url": row["poster_url"],
+                    "genre": row["genre"],
+                    "runtime": row["runtime"],
+                    "overview": row["tmdb_overview"],
+                    "in_jellyfin": in_jellyfin,
+                    "ott_platforms": ott_platforms,
+                })
+            return results
