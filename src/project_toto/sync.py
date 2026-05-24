@@ -51,6 +51,14 @@ def run_watchlist_sync() -> None:
                         runtime=details.get("runtime"),
                     )
 
+                # Fetch and store YouTube trailer key
+                trailer_key = tmdb_client.get_trailer_key(tmdb_movie.tmdb_id)
+                if trailer_key:
+                    db.update_trailer_key(
+                        movie_id=movie_id,
+                        trailer_key=trailer_key,
+                    )
+
         if settings.justwatch_enabled:
             justwatch = JustWatchClient(
                 country=settings.justwatch_country,
