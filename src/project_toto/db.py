@@ -167,6 +167,7 @@ class Database:
             self._ensure_column(conn, "movies", "mood_tags", "TEXT")
             self._ensure_column(conn, "movies", "collection", "TEXT")
             self._ensure_column(conn, "movies", "origin_country", "TEXT")
+            self._ensure_column(conn, "movies", "has_file", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(
                 conn, "sync_runs", "items_availability_refreshed", "INTEGER NOT NULL DEFAULT 0"
             )
@@ -459,13 +460,41 @@ class Database:
             )
             conn.commit()
 
+    def sync_has_file_from_radarr(self, file_status: dict[int, bool]) -> int:
+        """Update has_file for all tracked movies based on Radarr's hasFile status.
+
+        Args:
+            file_status: Mapping of tmdbId -> hasFile from Radarr.
+
+        Returns:
+            Number of movies updated.
+        """
+        if not file_status:
+            return 0
+        now = utc_now()
+        updated = 0
+        with self._connect() as conn:
+            for tmdb_id, has_file in file_status.items():
+                cursor = conn.execute(
+                    """
+                    UPDATE movies
+                    SET has_file = ?, updated_at = ?
+                    WHERE tmdb_id = ?
+                    """,
+                    (1 if has_file else 0, now, tmdb_id),
+                )
+                if cursor.rowcount > 0:
+                    updated += cursor.rowcount
+            conn.commit()
+        return updated
+
     def get_movie_by_tmdb_id(self, tmdb_id: int, country_code: str = "IN") -> Optional[dict]:
         """Return a movie dict with all fields needed for recommendations, or None."""
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
                 FROM movies m
                 WHERE m.tmdb_id = ?
                 """,
@@ -474,8 +503,8 @@ class Database:
             if not row:
                 return None
 
-            # Check Jellyfin availability (requested_in_radarr serves as proxy)
-            in_jellyfin = bool(row["requested_in_radarr"])
+            # Check Jellyfin availability (has_file means Radarr downloaded & imported)
+            in_jellyfin = bool(row["has_file"])
 
             # Get OTT platforms
             ott_rows = conn.execute(
@@ -514,7 +543,7 @@ class Database:
         with self._connect() as conn:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND m.runtime IS NOT NULL
@@ -525,13 +554,13 @@ class Database:
                 placeholders = ",".join("?" for _ in exclude)
                 query += f" AND m.tmdb_id NOT IN ({placeholders})"
                 params.extend(exclude)
-            query += " ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC LIMIT ?"
+            query += " ORDER BY m.has_file DESC, m.tmdb_popularity DESC LIMIT ?"
             params.append(limit)
             rows = conn.execute(query, params).fetchall()
 
             results: list[dict] = []
             for row in rows:
-                in_jellyfin = bool(row["requested_in_radarr"])
+                in_jellyfin = bool(row["has_file"])
                 ott_rows = conn.execute(
                     """
                     SELECT DISTINCT provider_name
@@ -567,7 +596,7 @@ class Database:
         with self._connect() as conn:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
             """
@@ -582,7 +611,7 @@ class Database:
 
             results: list[dict] = []
             for row in rows:
-                in_jellyfin = bool(row["requested_in_radarr"])
+                in_jellyfin = bool(row["has_file"])
                 ott_rows = conn.execute(
                     """
                     SELECT DISTINCT provider_name
@@ -708,10 +737,10 @@ class Database:
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.genre,
                        m.runtime, m.vote_average, m.director, m.mood_tags,
                        m.keywords, m.origin_country, m.collection,
-                       m.requested_in_radarr, m.cast_top3
+                       m.has_file, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
-                ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
+                ORDER BY m.has_file DESC, m.tmdb_popularity DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -719,7 +748,7 @@ class Database:
 
             results: list[dict] = []
             for row in rows:
-                in_jellyfin = bool(row["requested_in_radarr"])
+                in_jellyfin = bool(row["has_file"])
                 ott_rows = conn.execute(
                     """
                     SELECT DISTINCT provider_name
@@ -767,10 +796,10 @@ class Database:
                 # No keywords — just return most popular
                 query = """
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                           m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                           m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
-                    ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
+                    ORDER BY m.has_file DESC, m.tmdb_popularity DESC
                     LIMIT ?
                 """
                 rows = conn.execute(query, (limit,)).fetchall()
@@ -794,12 +823,12 @@ class Database:
 
                 query = f"""
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                           m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                           m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
                       AND ({where_clause})
                       {exclude_clause}
-                    ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
+                    ORDER BY m.has_file DESC, m.tmdb_popularity DESC
                     LIMIT ?
                 """
                 params.append(limit)
@@ -807,7 +836,7 @@ class Database:
 
             results: list[dict] = []
             for row in rows:
-                in_jellyfin = bool(row["requested_in_radarr"])
+                in_jellyfin = bool(row["has_file"])
                 ott_rows = conn.execute(
                     """
                     SELECT DISTINCT provider_name
