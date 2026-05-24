@@ -26,15 +26,71 @@ The full pipeline runs as a single `sync_watchlist.py` invocation and can be sch
 
 ## Media Stack
 
-Five Docker containers managed by Compose:
+Seven Docker containers managed by Compose:
 
 | Service | Purpose | Default Port |
 |---|---|---|
+| Gluetun | VPN tunnel (ProtonVPN WireGuard) | — |
+| qBittorrent | Download client (routed through VPN) | 8080 |
+| ClamAV | Post-download malware scanner | 3310 |
 | Prowlarr | Indexer management | 9696 |
 | Radarr | Movie monitoring & automation | 7878 |
-| qBittorrent | Download client | 8080 |
 | Jellyfin | Media server / playback | 8096 |
 | Bazarr | Automatic subtitles | 6767 |
+
+## Security
+
+The stack enforces four security rules:
+
+### Rule 1 — Only download video file formats
+qBittorrent is configured to skip dangerous file extensions automatically:
+
+```
+Session\ExcludedFileNames=*.exe, *.bat, *.cmd, *.msi, *.com, *.scr, *.zip, *.rar, *.7z, *.iso
+```
+
+Safe formats (`.mkv`, `.mp4`, `.avi`) are allowed. A movie is never an executable — if it is, it's malware. Subtitle archives aren't needed through torrents since Bazarr handles subtitles separately.
+
+### Rule 2 — ClamAV post-download scanning
+Every completed torrent is automatically scanned by ClamAV before you open it:
+
+- A dedicated `clamav` container runs the ClamAV daemon with auto-updating signatures.
+- qBittorrent's AutoRun triggers `scripts/scan_download.sh` on each completed download.
+- Scan results are logged to `mediaserver/data/torrents/scan.log`.
+- If a threat is detected, the entry is flagged in the log for manual review.
+
+You can also manually scan files:
+
+```sh
+# Via ClamAV container
+clamdscan --host clamav:3310 /data/torrents/complete/some-movie
+```
+
+Or upload suspicious files to [VirusTotal](https://www.virustotal.com) for a second opinion.
+
+### Rule 3 — VPN via Gluetun (mandatory for public trackers)
+All qBittorrent traffic is routed through a VPN tunnel:
+
+- **Gluetun** (`qmcgaw/gluetun`) runs as a container with `NET_ADMIN` and the TUN device.
+- qBittorrent uses `network_mode: "service:gluetun"`, meaning it shares the VPN container's network namespace and has **no independent internet access**.
+- Configured for ProtonVPN WireGuard — set credentials in `mediaserver/.env`.
+- Your IP is never exposed to torrent swarms.
+
+To configure ProtonVPN WireGuard credentials:
+
+1. Log into [account.protonvpn.com](https://account.protonvpn.com)
+2. Go to Downloads → WireGuard configuration
+3. Extract the private key, address, server public key, server address, and port
+4. Fill these into `mediaserver/.env` (see `mediaserver/.env.example`)
+
+### Rule 4 — Kill switch (three layers)
+If the VPN tunnel drops, **all torrent traffic stops** — your real IP is never exposed:
+
+1. **Docker-native kill switch**: qBittorrent shares gluetun's network namespace. If the VPN goes down, qBittorrent loses **all** network access — there is no fallback to the host interface.
+2. **Interface binding**: qBittorrent's `Connection\NetworkInterface` is set to `tun0` (the VPN tunnel). Even with an alternative route, qBittorrent would only use the tunnel.
+3. **Gluetun firewall**: Gluetun runs an iptables firewall that blocks all traffic except through the VPN tunnel. When the VPN reconnects, traffic resumes through the new tunnel automatically.
+
+**Verify the kill switch works**: after setup, stop the gluetun container and confirm that qBittorrent's WebUI becomes unreachable and no traffic flows.
 
 ## Prerequisites
 
@@ -215,7 +271,9 @@ project toto/
 │   ├── project_toto.db       # sqlite database (gitignored)
 │   └── logs/                 # application logs (gitignored)
 ├── mediaserver/
-│   ├── docker-compose.yml    # prowlarr, radarr, qbittorrent, jellyfin, bazarr
+│   ├── docker-compose.yml    # gluetun, qbittorrent, clamav, prowlarr, radarr, jellyfin, bazarr
+│   ├── scripts/
+│   │   └── scan_download.sh  # post-download ClamAV scanner
 │   ├── config/               # per-service config volumes (gitignored)
 │   └── data/                 # media + torrent data (gitignored)
 ├── scripts/
