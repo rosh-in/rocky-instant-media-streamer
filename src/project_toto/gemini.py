@@ -7,6 +7,8 @@ from typing import Optional
 
 import google.generativeai as genai
 
+from pathlib import Path
+
 from project_toto.db import Database
 from project_toto.jellyfin import JellyfinClient
 
@@ -39,7 +41,7 @@ class MovieConcierge:
     def __init__(
         self,
         gemini_api_key: str,
-        db_path: str,
+        db_path: Path,
         jellyfin_url: str,
         jellyfin_api_key: str,
         jellyfin_username: str,
@@ -56,7 +58,7 @@ class MovieConcierge:
 
         genai.configure(api_key=gemini_api_key)
         self.model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
+            model_name="gemini-2.5-flash-lite",
             system_instruction=SYSTEM_PROMPT,
             tools=[
                 self._get_watchlist,
