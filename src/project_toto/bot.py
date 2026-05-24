@@ -13,6 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
+    MessageReactionHandler,
     CommandHandler,
     ContextTypes,
     ApplicationBuilder,
@@ -21,9 +22,10 @@ from telegram.ext import (
 
 from project_toto.config import Settings, load_settings
 from project_toto.db import Database
-from project_toto.gemini import MovieConcierge, availability_label
+from project_toto.gemini import MovieConcierge, ChatConcierge, availability_label
 from project_toto.jellyfin import JellyfinClient
 from project_toto.stats import generate_stats
+from project_toto.taste_profile import generate_taste_profile
 from project_toto.tmdb import TmdbClient
 
 logger = logging.getLogger("project_toto.bot")
@@ -31,6 +33,8 @@ logger = logging.getLogger("project_toto.bot")
 # Per-chat concierge instances (conversation memory)
 _concierges: dict[int, MovieConcierge] = {}
 _concierge_last_used: dict[int, float] = {}
+_chat_concierges: dict[int, ChatConcierge] = {}
+_chat_concierge_last_used: dict[int, float] = {}
 _chat_locks: dict[int, asyncio.Lock] = {}
 
 # Play session storage for inline device buttons
@@ -44,6 +48,16 @@ _MAX_PLAY_SESSIONS = 500
 _BLOCKING_CALL_TIMEOUT_SECONDS = 45
 
 _FALLBACK_POSTER = "https://placehold.co/500x750/1a1a2e/eee?text=No+Poster"
+
+# Reaction emoji → reaction value mapping for watch_history
+REACTION_MAP = {
+    "❤️": "loved",
+    "🔥": "loved",
+    "👍": "liked",
+    "😐": "neutral",
+    "👎": "disliked",
+    "🤮": "abandoned",
+}
 
 # Persistent mood keyboard (Feature 6)
 MOOD_MAP = {
@@ -100,6 +114,16 @@ def _cleanup_concierges(now_ts: Optional[float] = None) -> None:
     for chat_id in stale_chat_ids:
         _concierges.pop(chat_id, None)
         _concierge_last_used.pop(chat_id, None)
+
+    # Also clean up chat concierges
+    stale_chat_ids = [
+        chat_id
+        for chat_id, last_used in _chat_concierge_last_used.items()
+        if (now - last_used) > _CONCIERGE_TTL_SECONDS
+    ]
+    for chat_id in stale_chat_ids:
+        _chat_concierges.pop(chat_id, None)
+        _chat_concierge_last_used.pop(chat_id, None)
 
 
 def _cleanup_play_sessions(now_ts: Optional[float] = None) -> None:
@@ -245,6 +269,21 @@ async def _guard_update(
         return False
 
     return True
+
+
+def _get_chat_concierge(chat_id: int, settings: Settings) -> ChatConcierge:
+    """Get or create a chat concierge for this chat (preserves conversation memory)."""
+    _cleanup_concierges()
+    concierge = _chat_concierges.get(chat_id)
+    if concierge is None:
+        _chat_concierges[chat_id] = ChatConcierge(
+            gemini_api_key=settings.gemini_api_key,
+            db_path=settings.sqlite_path,
+            country_code=settings.justwatch_country,
+        )
+        concierge = _chat_concierges[chat_id]
+    _chat_concierge_last_used[chat_id] = time.time()
+    return concierge
 
 
 def _friendly_error_message(exc: Exception, fallback: str) -> str:
@@ -490,9 +529,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Hey! I'm your movie concierge. Just tell me what you're in the mood for "
         "and I'll find something from your watchlist.\n\n"
         "Use the mood buttons below for quick picks, or just type what you want.\n\n"
-        "Slash commands: /devices, /status, /stats, /reset"
+        "Slash commands: /devices, /status, /stats, /reset, /chat"
     )
     await update.message.reply_text(text, reply_markup=MOOD_KEYBOARD)
+
+
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enter chat mode — free conversation with Gemini."""
+    if not await _guard_update(update, context):
+        return
+    settings: Settings = context.bot_data["settings"]
+    if not settings.gemini_api_key:
+        await update.message.reply_text("GEMINI_API_KEY not configured.")
+        return
+
+    # Reset any existing chat session
+    chat_id = update.effective_chat.id
+    existing = _chat_concierges.get(chat_id)
+    if existing:
+        existing.reset()
+
+    context.user_data["chat_mode"] = True
+    context.user_data["chat_history"] = []
+
+    # Send welcome with exit button
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
+    ])
+    await update.message.reply_text(
+        "Chat mode. Tell me what you're in the mood for, ask about anything "
+        "in your library, or just describe how you're feeling tonight.",
+        reply_markup=keyboard,
+    )
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -614,7 +682,7 @@ async def send_weekly_stats(bot, settings: Settings) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Main conversational handler — routes to recommendations or playback."""
+    """Main conversational handler — routes to chat mode or recommendations."""
     if not await _guard_update(update, context):
         return
     settings: Settings = context.bot_data["settings"]
@@ -626,6 +694,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_text = update.message.text or ""
+
+    # Chat mode — route to conversational handler
+    if context.user_data.get("chat_mode"):
+        await _handle_chat_message(update, context, user_text)
+        return
 
     # Feature 6: Intercept mood keyboard labels
     if user_text in MOOD_MAP:
@@ -772,6 +845,157 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await send_recommendations(update, context, movies)
 
 
+async def _handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
+    """Handle messages in /chat mode — conversational Gemini with RECOMMEND: parsing."""
+    settings: Settings = context.bot_data["settings"]
+    chat_id = update.effective_chat.id
+    lock = _get_chat_lock(chat_id)
+
+    async with lock:
+        try:
+            chat_concierge = _get_chat_concierge(chat_id, settings)
+            display_text, tmdb_ids = await asyncio.wait_for(
+                asyncio.to_thread(chat_concierge.chat_conversational, user_text),
+                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+            )
+            _chat_concierge_last_used[chat_id] = time.time()
+        except Exception as exc:
+            logger.exception("Chat concierge failed")
+            await update.message.reply_text(
+                _friendly_error_message(exc, "Something went wrong in chat mode. Please try again.")
+            )
+            return
+
+        # Update conversation history in user_data
+        history = context.user_data.get("chat_history", [])
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "model", "content": display_text})
+        # Keep last 20 entries
+        context.user_data["chat_history"] = history[-20:]
+
+        if tmdb_ids:
+            # Gemini recommended movies — show them with posters
+            movies = []
+            for tid in tmdb_ids:
+                movie = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        Database(settings.sqlite_path).get_movie_by_tmdb_id,
+                        tid, settings.justwatch_country,
+                    ),
+                    timeout=10,
+                )
+                if movie:
+                    movies.append(movie)
+
+            if movies:
+                # Send the conversational text first
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
+                ])
+                await update.message.reply_text(display_text, reply_markup=keyboard)
+                # Then send recommendation cards
+                context.user_data["current_recommendations"] = movies
+                await send_recommendations(update, context, movies)
+            else:
+                # IDs didn't resolve — just show the text
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
+                ])
+                await update.message.reply_text(display_text + "\n\n(Couldn't find those movies in your library.)", reply_markup=keyboard)
+        else:
+            # Pure conversation — no recommendation yet
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
+            ])
+            await update.message.reply_text(display_text, reply_markup=keyboard)
+
+
+async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle message reactions — map emoji to watch_history."""
+    if not await _guard_update(update, context, apply_rate_limit=False):
+        return
+    settings: Settings = context.bot_data["settings"]
+
+    # MessageReactionHandler provides update.message_reaction (MessageReactionUpdated)
+    reaction_update = update.message_reaction
+    if not reaction_update:
+        return
+
+    # Get current recommendations to find the movie this reaction applies to
+    current_recs = context.user_data.get("current_recommendations", [])
+
+    # Process each new reaction in the list
+    for reaction in (reaction_update.new_reaction or []):
+        # ReactionTypeEmoji has .emoji; ReactionTypeCustomEmoji does not
+        emoji = getattr(reaction, 'emoji', None)
+        if not emoji:
+            continue
+        reaction_value = REACTION_MAP.get(emoji)
+        if not reaction_value:
+            continue
+
+        # Try to find which movie was reacted to
+        # If we have recent recommendations, log the first one as a guess
+        # (Telegram doesn't tell us which specific message was reacted to easily)
+        if current_recs:
+            # Log for the most recent recommendation set
+            for movie in current_recs:
+                db = Database(settings.sqlite_path)
+                db.init_schema()
+                await asyncio.to_thread(
+                    db.log_watch_history,
+                    tmdb_id=movie.get("tmdb_id"),
+                    title=movie.get("title"),
+                    reaction=reaction_value,
+                    reaction_emoji=emoji,
+                )
+            logger.info("Logged reaction %s (%s) for %d movies", emoji, reaction_value, len(current_recs))
+
+
+async def cmd_watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual watch logging: /watched <movie title>"""
+    if not await _guard_update(update, context):
+        return
+    settings: Settings = context.bot_data["settings"]
+
+    # Parse the title from the command args
+    title = " ".join(context.args or []).strip() if context.args else ""
+    if not title:
+        await update.message.reply_text("Usage: /watched <movie title>\nExample: /watched Parasite")
+        return
+
+    # Try to find the movie in the DB
+    db = Database(settings.sqlite_path)
+    db.init_schema()
+
+    # Search by title
+    with db._connect() as conn:
+        row = conn.execute(
+            "SELECT tmdb_id, title FROM movies WHERE LOWER(title) LIKE ? AND tmdb_id IS NOT NULL LIMIT 1",
+            (f"%{title.lower()}%",),
+        ).fetchone()
+
+    if row:
+        await asyncio.to_thread(
+            db.log_watch_history,
+            tmdb_id=row["tmdb_id"],
+            title=row["title"],
+            reaction="liked",
+            reaction_emoji="👍",
+        )
+        await update.message.reply_text(f"Logged *{row['title']}* as watched 👍", parse_mode="Markdown")
+    else:
+        # Log even if not in DB
+        await asyncio.to_thread(
+            db.log_watch_history,
+            tmdb_id=None,
+            title=title,
+            reaction="liked",
+            reaction_emoji="👍",
+        )
+        await update.message.reply_text(f"Logged *{title}* as watched (not in your library)", parse_mode="Markdown")
+
+
 async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline keyboard button presses for recommendations."""
     if not await _guard_update(update, context, apply_rate_limit=False):
@@ -786,6 +1010,17 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     action = data.get("action")
+
+    if action == "exit_chat":
+        # Exit chat mode — clear state
+        context.user_data["chat_mode"] = False
+        context.user_data.pop("chat_history", None)
+        chat_id = update.effective_chat.id
+        existing = _chat_concierges.get(chat_id)
+        if existing:
+            existing.reset()
+        await query.edit_message_text("Exited chat mode. Back to normal — use the mood buttons or just type what you want.")
+        return
 
     if action == "pick":
         # User picked a movie — show device picker
@@ -1011,6 +1246,13 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("devices", cmd_devices))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("chat", cmd_chat))
+
+    # Reaction handler — uses MessageReactionHandler for message_reaction updates
+    app.add_handler(MessageReactionHandler(_handle_reaction))
+
+    # /watched command fallback for manual watch logging
+    app.add_handler(CommandHandler("watched", cmd_watched))
 
     # Recommendation inline button callback (JSON-based actions)
     app.add_handler(CallbackQueryHandler(callback_button, pattern=r'^\{".*"'))
@@ -1032,6 +1274,15 @@ def run_bot() -> None:
                 minute=0,
                 timezone="Asia/Kolkata",
                 args=[app.bot, settings],
+            )
+            # Weekly taste profile regeneration (same cadence as stats)
+            scheduler.add_job(
+                lambda: generate_taste_profile(settings.sqlite_path),
+                trigger="cron",
+                day_of_week="fri",
+                hour=17,
+                minute=50,
+                timezone="Asia/Kolkata",
             )
             scheduler.start()
             logger.info("Weekly stats scheduler started (Friday 18:00 Asia/Kolkata)")
