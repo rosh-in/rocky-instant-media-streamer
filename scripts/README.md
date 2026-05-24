@@ -15,6 +15,39 @@ python scripts/status.py          # last 5 runs
 python scripts/status.py --last 10
 ```
 
+## `play.py`
+Control Jellyfin playback from the terminal. Requires `JELLYFIN_API_KEY` and `JELLYFIN_USERNAME` in `.env`.
+
+### List active devices
+
+```sh
+python scripts/play.py devices
+```
+
+### Search the movie library
+
+```sh
+python scripts/play.py search "inception"
+```
+
+### Play a movie on a specific device
+
+```sh
+python scripts/play.py start "inception" "bravia"
+```
+
+The device name is a partial match against the Jellyfin device name or client name.
+
+## Telegram Bot
+
+Conversational movie concierge powered by Gemini 2.5 Flash Lite.
+
+```sh
+PYTHONPATH=src python -m project_toto.bot
+```
+
+Slash commands: `/start`, `/reset`, `/devices`, `/status`. All text messages are routed to the Gemini concierge with per-chat memory and inline device selection buttons.
+
 ## Scheduled Sync (macOS launchd)
 
 The `dev.toto.sync.plist` file runs the sync script automatically every 24 hours.

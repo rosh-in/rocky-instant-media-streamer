@@ -26,7 +26,7 @@ The full pipeline runs as a single `sync_watchlist.py` invocation and can be sch
 
 ## Media Stack
 
-Seven Docker containers managed by Compose:
+Eight Docker containers managed by Compose:
 
 | Service | Purpose | Default Port |
 |---|---|---|
@@ -37,6 +37,7 @@ Seven Docker containers managed by Compose:
 | Radarr | Movie monitoring & automation | 7878 |
 | Jellyfin | Media server / playback | 8096 |
 | Bazarr | Automatic subtitles | 6767 |
+| FlareSolverr | Cloudflare bypass for Prowlarr indexers | 8191 |
 
 ## Security
 
@@ -193,7 +194,7 @@ Requires `JELLYFIN_API_KEY` and `JELLYFIN_USERNAME` in `.env`. Generate an API k
 
 ### Telegram bot
 
-Conversational movie concierge powered by Gemini, with Jellyfin playback control:
+Conversational movie concierge powered by Gemini 2.5 Flash Lite, with Jellyfin playback control:
 
 ```sh
 PYTHONPATH=src python -m project_toto.bot
@@ -209,6 +210,8 @@ Available slash commands:
 - `/reset` — Clear conversation memory
 - `/devices` — List active Jellyfin devices
 - `/status` — Show last sync run and library stats
+
+The bot supports inline device selection — when you ask to play a movie without specifying a device, it shows a button picker. It also enforces per-user rate limiting and optional access allowlists.
 
 Requires `TELEGRAM_BOT_TOKEN` (from @BotFather) and `GEMINI_API_KEY` in `.env`.
 The current shared settings loader also requires `LETTERBOXD_USERNAME` and `TMDB_API_KEY` to be present when launching the bot.
@@ -283,6 +286,7 @@ project toto/
 │   ├── dev.toto.sync.plist   # macOS launchd schedule
 │   └── README.md             # script + scheduling docs
 └── src/project_toto/
+    ├── __init__.py           # package marker
     ├── config.py             # settings loader (.env → dataclass)
     ├── db.py                 # sqlite schema, sync runs, movie CRUD
     ├── letterboxd.py         # watchlist scraper
@@ -290,9 +294,9 @@ project toto/
     ├── justwatch.py          # OTT availability via JustWatch GraphQL
     ├── radarr.py             # Radarr API client
     ├── sync.py               # pipeline orchestration
-    ├── jellyfin.py           # Jellyfin playback client
-    ├── gemini.py             # Gemini recommendation engine
-    ├── bot.py                # Telegram bot
+    ├── jellyfin.py           # Jellyfin playback client (play, pause, stop)
+    ├── gemini.py             # Gemini 2.5 Flash Lite concierge with tool use
+    ├── bot.py                # Telegram bot (polling, inline buttons, rate limiting)
     └── logging_config.py     # structured logging setup
 ```
 
@@ -302,7 +306,7 @@ project toto/
 - [x] Phase 1 — Watchlist parsing + TMDB enrichment + Radarr sync
 - [x] Phase 2 — OTT availability via JustWatch
 - [x] Phase 3 — Automation & reliability (logging, retries, scheduling, status CLI)
-- [ ] Phase 4 — Bazarr + subtitle automation
+- [x] Phase 4 — Bazarr + subtitle automation
 - [x] Phase 5 — Jellyfin multi-device playback control
 - [x] Phase 6 — Telegram bot + Gemini-powered recommendations
 - [ ] Phase 7 — Optional Raspberry Pi migration
