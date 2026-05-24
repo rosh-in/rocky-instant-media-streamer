@@ -1,8 +1,21 @@
 # Project Toto
 
-Personal home media automation system that discovers movies from a Letterboxd watchlist, enriches them with metadata, checks streaming availability, and pushes requests to a local media stack — all hands-free.
+A zero-friction home media system — from watchlist to watching in one tap.
 
-## How It Works
+I built Project Toto to solve a real problem in my home: the frustrating gap between "I want to watch something" and "it's actually playing on my TV." What started as a personal automation project evolved through seven iterative phases into a complete product — from infrastructure to AI-powered interaction — and became the case study I use to demonstrate how I think about building products.
+
+## The Problem
+
+Deciding what to watch and getting it ready involved a fragmented workflow:
+- Checking what's on my Letterboxd watchlist, then manually searching across streaming services
+- Downloading and organizing files separately, then hoping Jellyfin picks them up
+- Managing playback across multiple devices (TV, phone, laptop) with no unified control
+
+Each step worked in isolation, but the handoffs were manual, unreliable, and slow. The total time from "I want to watch X" to "X is playing" was 20+ minutes of active effort — almost always on the couch when nobody wants to be doing admin work.
+
+## The Product
+
+Project Toto eliminates every manual step in the watchlist-to-watching pipeline:
 
 ```
 Letterboxd Watchlist
@@ -17,12 +30,79 @@ Letterboxd Watchlist
    Radarr Push ──► qBittorrent ──► Jellyfin
 ```
 
-1. **Scrape** — Parses your Letterboxd watchlist pages.
-2. **Enrich** — Looks up each movie on TMDB for structured metadata.
-3. **Availability** — Queries JustWatch to record which OTT platforms carry each title.
-4. **Request** — Pushes movies (that aren't already tracked) into Radarr, which hands off to qBittorrent for downloading and Jellyfin for streaming.
+- **Discover** — Scrapes your Letterboxd watchlist and enriches each movie with TMDB metadata (posters, genres, trailers, mood tags, cast, directors).
+- **Track availability** — Queries JustWatch to know which OTT platforms carry each title, so you never pay for something already streaming.
+- **Automate delivery** — Pushes untracked movies to Radarr, which hands off to qBittorrent → Jellyfin. New movies appear in your library without you touching anything.
+- **Control playback** — Chat with the Telegram bot: "Play Inception on my TV" or "Something light, under 2 hours." Gemini picks from your watchlist, finds the movie in Jellyfin, and plays it on the right device.
+- **Understand your taste** — The bot builds a taste profile from your watch history (loved/liked/disliked genres, directors, countries) and uses it to make better recommendations over time.
 
-The full pipeline runs as a single `sync_watchlist.py` invocation and can be scheduled to run daily via macOS launchd.
+The full pipeline runs as a single scheduled job (daily via macOS launchd) and requires zero day-to-day interaction.
+
+## Key Product Decisions & Trade-offs
+
+### SQLite over Postgres
+A media library for a household doesn't need a server process. SQLite is zero-config, runs embedded, and handles the read-heavy query pattern perfectly. The trade-off: no built-in concurrency — but only one sync job runs at a time, so it's the right constraint for the problem.
+
+### Gemini Flash Lite over larger models
+The concierge runs on Gemini 2.5 Flash Lite (free tier: 15 RPM). I built a proactive RPM tracker and retry system with exponential backoff so the bot stays within quota without users ever seeing a delay. The trade-off: less nuanced reasoning than larger models — but for "pick a movie from this list," speed and cost win over depth.
+
+### Telegram bot over a custom web UI
+Building a conversational interface via Telegram gave me a fully hosted, cross-platform UI with push notifications, inline buttons, and auth — for free. The trade-off: less layout control — but the goal was reducing friction to zero, and everyone already has Telegram open.
+
+### Dry-run by default for Radarr
+New installs run Radarr in dry-run mode (logs what *would* be added without pushing). This is a safety-first default: one wrong config could flood your library. Users opt into live mode explicitly. The trade-off: extra step to go live — but it prevents the worst failure mode on first use.
+
+### VPN kill switch with three redundant layers
+Security isn't a feature you ship once — it's a property that must hold even when things break. The kill switch uses Docker network namespacing + interface binding + iptables firewall so that if *any* layer fails, the others still block traffic. The trade-off: harder to debug network issues — but the guarantee (IP never exposed) is worth the operational complexity.
+
+### What I deprioritized
+- **Jellyseerr (request management UI)** — Overkill for a household. A Telegram bot handles the same job with less setup.
+- **Cloud deployment** — Home media is inherently local. Cloud adds latency and cost for no user benefit.
+- **Multi-user access control** — The bot's optional allowlist is sufficient. Full RBAC is scope creep for a family setup.
+- **Web dashboard** — Would be nice, but the CLI + bot + Jellyfin UI already cover all use cases. A FastAPI layer is reserved for future expansion.
+
+## Impact & Metrics
+
+The system has been running daily since Phase 1:
+
+- **End-to-end automation**: Watchlist sync → metadata enrichment → availability check → Radarr push runs unattended daily. Zero manual intervention.
+- **Sync observability**: Every run is tracked in `sync_runs` with seen/enriched/availability/requested counts and success/failure status. The `status.py` CLI surfaces this instantly.
+- **Reliability**: All external API calls (TMDB, JustWatch, Letterboxd, Radarr) retry with exponential backoff on transient failures. Structured rotating logs make debugging deterministic.
+- **Security posture**: 3-layer VPN kill switch verified — qBittorrent has no internet path outside the tunnel. ClamAV scans every completed download. Dangerous file extensions are excluded at the client level.
+- **Household adoption**: Family members use the Telegram bot for movie discovery and playback without needing to understand any underlying service. The bot's natural-language interface reduced the learning curve to zero.
+- **Taste intelligence**: The bot builds per-user taste profiles from watch history (genre patterns, director preferences, country affinity) and feeds them into recommendations — the system gets better the more you use it.
+
+## How I Built This — 0 to 1 in 7 Phases
+
+I treated this like a product launch: each phase had a clear scope, success criteria, and user-facing outcome.
+
+- **Phase 0 — Infrastructure**: Docker Compose stack (8 containers). Shipped first because nothing else works without a stable foundation.
+- **Phase 1 — Core pipeline**: Letterboxd scraper → TMDB enrichment → SQLite → Radarr push. The minimum viable loop: "I add a movie, it appears in Jellyfin."
+- **Phase 2 — Availability intelligence**: JustWatch integration. Now the system knows *where* a movie is available, not just *that* it exists. Prevents unnecessary downloads when a title is already streaming.
+- **Phase 3 — Reliability**: Logging, retries, scheduled execution, status CLI. Made the pipeline trustworthy enough to run unattended.
+- **Phase 4 — Subtitles**: Bazarr + FlareSolverr. Small addition, outsized impact on non-English households.
+- **Phase 5 — Playback control**: Jellyfin API client with multi-device support. For the first time, you could trigger playback without leaving the couch.
+- **Phase 6 — Conversational interface**: Telegram bot + Gemini concierge with tool use, inline device picker, taste profiles, and rate limiting. The "aha" moment — the system went from automated to intelligent.
+
+Each phase was incremental and backward-compatible. No rewrites, no breaking changes. The roadmap is documented in [ROADMAP.md](ROADMAP.md) and the product spec in [PRD.md](PRD.md).
+
+## Future Product Vision
+
+### Near-term
+- **Watch history loop** — Jellyfin webhooks already log playback events into `watch_history`. Next: auto-remove watched movies from the watchlist, auto-refresh availability, and surface "you watched X last week" in bot recommendations.
+- **Raspberry Pi migration** — Run the bot and automation services 24/7 on a Pi so the Mac doesn't need to be awake for scheduled syncs.
+
+### Medium-term
+- **Household profiles** — Per-user taste profiles already exist. Next: let each family member have their own bot conversation with personalized recommendations, not just a shared session.
+- **FastAPI dashboard** — A lightweight web layer for browse/search/status, using the existing SQLite data and webhook infrastructure. Enables mobile browser access without Telegram.
+- **Social features** — Letterboxd friends' watchlists as discovery signals: "Your friend Alex just added X."
+
+### Long-term
+- **Content-based recommendation engine** — Replace Gemini's watchlist-only picks with a collaborative or content-based model that can surface movies *outside* the watchlist based on taste patterns.
+- **Multi-home support** — The architecture already separates the automation layer from the media layer. With a FastAPI API and shared DB, two households could run independent stacks with a shared recommendation signal.
+
+<details>
+<summary><strong>Technical Reference</strong></summary>
 
 ## Media Stack
 
@@ -269,6 +349,7 @@ All external API calls (TMDB, JustWatch, Letterboxd, Radarr) include automatic r
 project toto/
 ├── .env.example              # env var template
 ├── PRD.md                    # product requirements
+├── ROADMAP.md                # phased execution tracker
 ├── requirements.txt          # python dependencies
 ├── data/
 │   ├── project_toto.db       # sqlite database (gitignored)
@@ -283,31 +364,25 @@ project toto/
 │   ├── sync_watchlist.py     # main sync entrypoint
 │   ├── status.py             # sync run health checker
 │   ├── play.py               # jellyfin playback control
+│   ├── run_webhook.py        # FastAPI webhook launcher
 │   ├── dev.toto.sync.plist   # macOS launchd schedule
 │   └── README.md             # script + scheduling docs
 └── src/project_toto/
     ├── __init__.py           # package marker
     ├── config.py             # settings loader (.env → dataclass)
-    ├── db.py                 # sqlite schema, sync runs, movie CRUD
+    ├── db.py                 # sqlite schema, sync runs, movie CRUD, mood tags
     ├── letterboxd.py         # watchlist scraper
     ├── tmdb.py               # TMDB metadata enrichment
     ├── justwatch.py          # OTT availability via JustWatch GraphQL
     ├── radarr.py             # Radarr API client
     ├── sync.py               # pipeline orchestration
     ├── jellyfin.py           # Jellyfin playback client (play, pause, stop)
-    ├── gemini.py             # Gemini 2.5 Flash Lite concierge with tool use
+    ├── gemini.py             # Gemini 2.5 Flash Lite concierge with tool use + RPM management
     ├── bot.py                # Telegram bot (polling, inline buttons, rate limiting)
+    ├── stats.py              # watchlist progress card generator
+    ├── taste_profile.py      # per-user taste profile from watch history
+    ├── webhook.py            # FastAPI webhook server (Jellyfin + Radarr events)
     └── logging_config.py     # structured logging setup
 ```
 
-## Roadmap
-
-- [x] Phase 0 — Media stack foundation (Docker Compose)
-- [x] Phase 1 — Watchlist parsing + TMDB enrichment + Radarr sync
-- [x] Phase 2 — OTT availability via JustWatch
-- [x] Phase 3 — Automation & reliability (logging, retries, scheduling, status CLI)
-- [x] Phase 4 — Bazarr + subtitle automation
-- [x] Phase 5 — Jellyfin multi-device playback control
-- [x] Phase 6 — Telegram bot + Gemini-powered recommendations
-- [ ] Phase 7 — Optional Raspberry Pi migration
-- [ ] Phase 8 — Polish and public release
+</details>
