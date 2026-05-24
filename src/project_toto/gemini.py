@@ -13,7 +13,6 @@ from pathlib import Path
 
 from project_toto.db import Database
 from project_toto.jellyfin import JellyfinClient
-from project_toto.taste_profile import load_taste_profile
 
 logger = logging.getLogger("project_toto.gemini")
 
@@ -284,18 +283,12 @@ class MovieConcierge:
 # Chat Concierge — conversational mode for /chat command
 # ---------------------------------------------------------------------------
 
-CHAT_SYSTEM_PROMPT = """You are a personal movie concierge with deep knowledge of the user's taste. You have access to their watchlist, watch history, and ratings.
-
-Rules:
-- Only recommend from the provided library
-- Be conversational, not listy
-- When recommending, explain why in one sentence
-- Remember everything said earlier in this conversation
-- If the user is vague, make an educated guess rather than asking too many questions
-- You can discuss films, directors, themes freely
-- When you decide to recommend, end with: RECOMMEND: [tmdb_id1, tmdb_id2, tmdb_id3]
-  (so the bot can parse it and show posters)
-- Never recommend movies not in the provided library list
+CHAT_SYSTEM_PROMPT = """You are a personal movie concierge.
+Library format: tmdb_id|title|director|genre|runtime|rating|mood|availability
+Rules: recommend only from library. Be brief and conversational. One sentence why per pick.
+End recommendations with RECOMMEND:[id1,id2,id3]
+If unsure, guess — don't ask more than one question.
+✅=Jellyfin 🎬=OTT
 """
 
 
@@ -329,29 +322,28 @@ def parse_chat_response(response_text: str) -> tuple[str, Optional[list[int]]]:
 
 
 def build_library_context(movies: list[dict]) -> str:
-    """Build the compact library format for Gemini's context block.
+    """Build ultra-compact library format for Gemini's context block.
 
-    Format: [tmdb_id] Title (Year) | Director | Genre | Runtime | Rating | Mood | In Jellyfin/OTT
+    Format: tmdb_id|title (year)|director|genre|runtime|rating|mood|availability
+    ~12 tokens per movie vs ~20 with the old format.
     """
     lines = []
     for m in movies:
-        title = m.get("title", "Unknown")
+        title = m.get("title", "?")
         year = m.get("year") or ""
-        year_str = f" ({year})" if year else ""
+        year_str = f"({year})" if year else ""
         director = m.get("director") or ""
         genre = m.get("genre") or ""
         runtime = m.get("runtime") or ""
         rating = m.get("vote_average") or ""
         rating_str = f"{rating:.1f}" if isinstance(rating, float) else str(rating) if rating else ""
         mood = m.get("mood_tags") or ""
-        jellyfin = "Jellyfin" if m.get("in_jellyfin") else ""
-        ott = m.get("ott_platforms") or ""
-        avail_parts = [p for p in [jellyfin, ott] if p]
-        avail = "/".join(avail_parts) if avail_parts else "unavailable"
+        avail = "✅" if m.get("in_jellyfin") else f"🎬{m.get('ott_platforms', '')}"
 
         lines.append(
-            f"[{m.get('tmdb_id', '?')}] {title}{year_str} | {director} | {genre} | "
-            f"{runtime}m | {rating_str} | {mood} | {avail}"
+            f"{m.get('tmdb_id', '?')}|{title} {year_str}|"
+            f"{director}|{genre}|{runtime}m|"
+            f"⭐{rating_str}|{mood}|{avail}"
         )
     return "\n".join(lines)
 
@@ -359,9 +351,9 @@ def build_library_context(movies: list[dict]) -> str:
 class ChatConcierge:
     """Conversational movie concierge for /chat mode.
 
-    Unlike MovieConcierge which does structured JSON recommendations,
-    this carries a full conversation with rich context, taste profiling,
-    and a RECOMMEND: trigger for inline movie cards.
+    Uses Gemini's native chat session with system_instruction carrying
+    the full context (taste profile + library). Sent exactly ONCE on
+    session creation — not re-sent on every message.
     """
 
     def __init__(
@@ -374,60 +366,105 @@ class ChatConcierge:
         self.db.init_schema()
         self.country_code = country_code.upper()
         self.gemini_api_key = gemini_api_key
+        self._last_call_time: float = 0.0
 
         genai.configure(api_key=gemini_api_key)
 
+        # Build the full system instruction ONCE — taste + library + rules
+        system_instruction = self._build_system_instruction()
+
         self.chat_model = genai.GenerativeModel(
             model_name="gemini-2.5-flash-lite",
-            system_instruction=CHAT_SYSTEM_PROMPT,
+            system_instruction=system_instruction,
         )
 
-        # Conversation history (managed as Gemini's chat session)
+        # Native chat session — history managed server-side
         self.chat_session = self.chat_model.start_chat()
 
-        # Initial context has been sent?
-        self._context_initialized = False
+    def _build_system_instruction(self) -> str:
+        """Build the complete system instruction: rules + taste + library.
 
-    def _build_full_context(self) -> str:
-        """Build the full context block: taste profile + library."""
-        # Taste profile
-        taste = load_taste_profile()
+        This is sent exactly once as system_instruction — never again.
+        Target: ~510 tokens total.
+        """
+        taste = self._build_compact_taste_profile()
+        library = self._build_compact_library()
 
-        # Library (compact format, top 50)
+        return (
+            f"{CHAT_SYSTEM_PROMPT}\n"
+            f"TASTE PROFILE:\n{taste}\n"
+            f"LIBRARY:\n{library}"
+        )
+
+    def _build_compact_taste_profile(self) -> str:
+        """Hard-capped 3-line taste profile (~80 tokens)."""
+        loved = self.db.get_watched_movies(reaction="loved", limit=5)
+        disliked = self.db.get_watched_movies(reaction="disliked", limit=2)
+
+        if not loved:
+            return "No watch history yet."
+
+        loved_titles = ", ".join(m["title"] for m in loved[:5])
+        disliked_titles = ", ".join(m["title"] for m in disliked[:2]) if disliked else "none"
+
+        # Derive top genre from loved movies
+        genre_counter: dict[str, int] = {}
+        for m in loved:
+            for g in (m.get("genre") or "").replace("/", ",").split(","):
+                g = g.strip()
+                if g:
+                    genre_counter[g] = genre_counter.get(g, 0) + 1
+        top_genre = max(genre_counter, key=genre_counter.get) if genre_counter else "varied"
+
+        return (
+            f"Loved: {loved_titles}\n"
+            f"Disliked: {disliked_titles}\n"
+            f"Pattern: favours {top_genre}"
+        )
+
+    def _build_compact_library(self) -> str:
+        """Ultra-compact library — 30 movies, ~350 tokens."""
         movies = self.db.get_movies_for_chat_context(
             country_code=self.country_code,
-            limit=50,
+            limit=30,
         )
-        library_text = build_library_context(movies)
-
-        context_parts = [
-            f"TASTE PROFILE:\n{taste}",
-            f"\nAVAILABLE LIBRARY:\n{library_text}",
-        ]
-        return "\n".join(context_parts)
+        return build_library_context(movies)
 
     def chat_conversational(self, user_message: str) -> tuple[str, Optional[list[int]]]:
         """Send a user message in chat mode and get a response.
 
         Returns (display_text, tmdb_ids_or_None).
-        On first message, sends the full context block as a setup.
+        Context is already in the system instruction — only the new
+        user message is sent per turn.
         """
-        try:
-            if not self._context_initialized:
-                # Send context as the first user message so Gemini has the library
-                context = self._build_full_context()
-                self.chat_session.send_message(context)
-                self._context_initialized = True
+        import time as _time
 
-            response = self.chat_session.send_message(user_message)
-            raw_text = response.text
+        # Simple cooldown — 3 seconds between Gemini calls
+        now = _time.monotonic()
+        elapsed = now - self._last_call_time
+        if elapsed < 3:
+            _time.sleep(3 - elapsed)
+        self._last_call_time = _time.monotonic()
 
-        except Exception as exc:
-            err_msg = str(exc)
-            if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
-                return "Gemini API quota exceeded — try again in a minute.", None
-            logger.exception("Chat concierge failed")
-            return f"Something went wrong: {err_msg}", None
+        # Retry with backoff on quota errors
+        max_retries = 3
+        raw_text = ""
+        for attempt in range(max_retries):
+            try:
+                response = self.chat_session.send_message(user_message)
+                raw_text = response.text
+                break
+            except Exception as exc:
+                err_msg = str(exc)
+                if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
+                    if attempt < max_retries - 1:
+                        wait = 60  # quota resets per minute
+                        logger.warning("Gemini quota hit, retrying in %ds (attempt %d/%d)", wait, attempt + 1, max_retries)
+                        _time.sleep(wait)
+                        continue
+                    return "Gemini API quota exceeded — try again in a minute.", None
+                logger.exception("Chat concierge failed")
+                return f"Something went wrong: {err_msg}", None
 
         # Parse for RECOMMEND: trigger
         display_text, tmdb_ids = parse_chat_response(raw_text)
@@ -436,5 +473,11 @@ class ChatConcierge:
 
     def reset(self) -> None:
         """Reset conversation history for a new /chat session."""
+        # Rebuild system instruction (taste may have changed)
+        system_instruction = self._build_system_instruction()
+        self.chat_model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash-lite",
+            system_instruction=system_instruction,
+        )
         self.chat_session = self.chat_model.start_chat()
-        self._context_initialized = False
+        self._last_call_time = 0.0
