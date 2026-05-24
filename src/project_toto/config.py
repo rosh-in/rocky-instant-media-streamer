@@ -31,6 +31,10 @@ class Settings:
     jellyfin_username: str
     telegram_bot_token: Optional[str]
     gemini_api_key: Optional[str]
+    telegram_allowed_user_ids: frozenset[int]
+    telegram_allowed_chat_ids: frozenset[int]
+    telegram_rate_limit_window_seconds: int
+    telegram_rate_limit_max_messages: int
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -42,6 +46,23 @@ def _as_bool(value: str, default: bool = False) -> bool:
     if cleaned in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+def _as_int_set(value: str, var_name: str) -> frozenset[int]:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return frozenset()
+
+    values: set[int] = set()
+    for part in cleaned.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError as exc:
+            raise ValueError(f"{var_name} must be a comma-separated list of integers.") from exc
+    return frozenset(values)
 
 
 def load_settings() -> Settings:
@@ -70,6 +91,22 @@ def load_settings() -> Settings:
     jellyfin_username = os.getenv("JELLYFIN_USERNAME", "").strip()
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
+    telegram_allowed_user_ids = _as_int_set(
+        os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""),
+        "TELEGRAM_ALLOWED_USER_IDS",
+    )
+    telegram_allowed_chat_ids = _as_int_set(
+        os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", ""),
+        "TELEGRAM_ALLOWED_CHAT_IDS",
+    )
+    telegram_rate_limit_window_seconds_raw = os.getenv(
+        "TELEGRAM_RATE_LIMIT_WINDOW_SECONDS",
+        "20",
+    ).strip()
+    telegram_rate_limit_max_messages_raw = os.getenv(
+        "TELEGRAM_RATE_LIMIT_MAX_MESSAGES",
+        "8",
+    ).strip()
 
     if not username:
         raise ValueError("Missing LETTERBOXD_USERNAME in environment.")
@@ -94,6 +131,14 @@ def load_settings() -> Settings:
         justwatch_max_results = int(justwatch_max_results_raw)
     except ValueError as exc:
         raise ValueError("JUSTWATCH_MAX_RESULTS must be an integer.") from exc
+    try:
+        telegram_rate_limit_window_seconds = int(telegram_rate_limit_window_seconds_raw)
+    except ValueError as exc:
+        raise ValueError("TELEGRAM_RATE_LIMIT_WINDOW_SECONDS must be an integer.") from exc
+    try:
+        telegram_rate_limit_max_messages = int(telegram_rate_limit_max_messages_raw)
+    except ValueError as exc:
+        raise ValueError("TELEGRAM_RATE_LIMIT_MAX_MESSAGES must be an integer.") from exc
 
     if max_pages < 1:
         raise ValueError("LETTERBOXD_MAX_PAGES must be >= 1.")
@@ -105,6 +150,10 @@ def load_settings() -> Settings:
         raise ValueError("JUSTWATCH_REFRESH_HOURS must be >= 0.")
     if justwatch_max_results < 1:
         raise ValueError("JUSTWATCH_MAX_RESULTS must be >= 1.")
+    if telegram_rate_limit_window_seconds < 0:
+        raise ValueError("TELEGRAM_RATE_LIMIT_WINDOW_SECONDS must be >= 0.")
+    if telegram_rate_limit_max_messages < 0:
+        raise ValueError("TELEGRAM_RATE_LIMIT_MAX_MESSAGES must be >= 0.")
 
     return Settings(
         letterboxd_username=username,
@@ -130,4 +179,8 @@ def load_settings() -> Settings:
         jellyfin_username=jellyfin_username,
         telegram_bot_token=telegram_bot_token,
         gemini_api_key=gemini_api_key,
+        telegram_allowed_user_ids=telegram_allowed_user_ids,
+        telegram_allowed_chat_ids=telegram_allowed_chat_ids,
+        telegram_rate_limit_window_seconds=telegram_rate_limit_window_seconds,
+        telegram_rate_limit_max_messages=telegram_rate_limit_max_messages,
     )
