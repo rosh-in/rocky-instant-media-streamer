@@ -119,3 +119,40 @@ class TmdbClient:
             "genre": genre_names,
             "runtime": runtime,
         }
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _get_movie_videos(self, tmdb_id: int) -> Dict[str, Any]:
+        """Fetch videos for a movie from /movie/{id}/videos endpoint."""
+        params = {
+            "api_key": self.api_key,
+            "language": "en-US",
+        }
+        response = self.session.get(
+            f"{self.base_url}/movie/{tmdb_id}/videos", params=params, timeout=20
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_trailer_key(self, tmdb_id: int) -> Optional[str]:
+        """Fetch the YouTube trailer key for a movie by TMDB ID.
+
+        Returns the YouTube video key (e.g. 'dQw4w9WgXcQ') or None.
+        """
+        try:
+            data = self._get_movie_videos(tmdb_id)
+        except Exception:
+            logger.warning("Failed to fetch TMDB videos for id=%s", tmdb_id)
+            return None
+
+        for video in data.get("results", []):
+            if video.get("type") == "Trailer" and video.get("site") == "YouTube":
+                key = video.get("key")
+                if key:
+                    return key
+        return None
