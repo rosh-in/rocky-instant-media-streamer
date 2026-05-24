@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import time as _time
+from collections import deque
 from typing import Optional
 
 import google.generativeai as genai
@@ -15,6 +18,94 @@ from project_toto.db import Database
 from project_toto.jellyfin import JellyfinClient
 
 logger = logging.getLogger("project_toto.gemini")
+
+# Gemini 2.5 Flash-Lite free-tier limits: 15 RPM, 250K TPM, 1000 RPD.
+# We track RPM proactively so we rarely hit 429 in the first place.
+_GEMINI_FREE_RPM = 15
+_GEMINI_RPM_WINDOW = 60  # seconds
+_GEMINI_MIN_INTERVAL = _GEMINI_RPM_WINDOW / _GEMINI_FREE_RPM  # 4s
+_GEMINI_MAX_RETRIES = 3
+_GEMINI_BACKOFF_BASE = 2  # seconds
+_GEMINI_BACKOFF_MAX = 60  # seconds
+
+
+def _extract_retry_after(err_msg: str) -> Optional[float]:
+    """Try to extract retry-delay seconds from a Gemini 429 error message."""
+    import re as _re
+    # Google often includes "retry_after: Ns" or "retry-delay: Ns"
+    m = _re.search(r"retry[_-]?(?:after|delay)[:\s]+(\d+(?:\.\d+)?)s?", err_msg, _re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+class _RPMTracker:
+    """Lightweight sliding-window tracker for Gemini RPM."""
+
+    def __init__(self, rpm: int = _GEMINI_FREE_RPM, window: float = _GEMINI_RPM_WINDOW):
+        self._rpm = rpm
+        self._window = window
+        self._timestamps: deque[float] = deque()
+
+    def record(self) -> None:
+        self._timestamps.append(_time.monotonic())
+
+    def wait_if_needed(self) -> None:
+        """Block until it's safe to make another request (respects RPM + min interval)."""
+        now = _time.monotonic()
+        cutoff = now - self._window
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.popleft()
+
+        # Enforce minimum interval between calls
+        if self._timestamps:
+            elapsed_since_last = now - self._timestamps[-1]
+            if elapsed_since_last < _GEMINI_MIN_INTERVAL:
+                _time.sleep(_GEMINI_MIN_INTERVAL - elapsed_since_last)
+
+        # If at RPM cap, wait until oldest entry expires
+        if len(self._timestamps) >= self._rpm:
+            wait_time = self._timestamps[0] - cutoff + 0.5  # small buffer
+            if wait_time > 0:
+                logger.info("RPM cap reached, waiting %.1fs", wait_time)
+                _time.sleep(wait_time)
+
+
+def _call_with_retry(send_fn, label: str = "Gemini") -> str:
+    """Call a Gemini send function with proactive RPM gating + retry on 429.
+
+    Args:
+        send_fn: Callable that returns the response text (or raises).
+        label: Human-readable label for logging.
+
+    Returns:
+        The response text string.
+
+    Raises:
+        Exception on non-429 or after exhausting retries.
+    """
+    for attempt in range(_GEMINI_MAX_RETRIES):
+        try:
+            return send_fn()
+        except Exception as exc:
+            err_msg = str(exc)
+            is_quota = "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg
+            if not is_quota:
+                raise
+            if attempt < _GEMINI_MAX_RETRIES - 1:
+                # Prefer server-suggested retry delay, else exponential backoff + jitter
+                server_wait = _extract_retry_after(err_msg)
+                if server_wait:
+                    wait = server_wait
+                else:
+                    wait = min(_GEMINI_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1), _GEMINI_BACKOFF_MAX)
+                logger.warning(
+                    "%s quota hit (attempt %d/%d), retrying in %.1fs",
+                    label, attempt + 1, _GEMINI_MAX_RETRIES, wait,
+                )
+                _time.sleep(wait)
+                continue
+            raise
 
 SYSTEM_PROMPT = """\
 You are a personal movie concierge for a home media system. You help the user \
@@ -96,6 +187,7 @@ class MovieConcierge:
             enable_automatic_function_calling=True
         )
         self._pending_device_picker: Optional[dict] = None
+        self._rpm_tracker = _RPMTracker()
 
     # -- Tool functions for playback (schema inferred from signatures + docstrings) --
 
@@ -208,10 +300,14 @@ class MovieConcierge:
         )
 
         # Step 3: Call Gemini with a lightweight model (no tools)
+        self._rpm_tracker.wait_if_needed()
         try:
             rec_model = genai.GenerativeModel("gemini-2.5-flash-lite")
-            response = rec_model.generate_content(prompt)
-            raw = response.text.strip()
+            raw = _call_with_retry(
+                lambda: rec_model.generate_content(prompt).text.strip(),
+                label="MovieConcierge.recommend",
+            )
+            self._rpm_tracker.record()
 
             # Try to extract JSON array from response
             # Gemini might wrap in markdown code blocks
@@ -258,9 +354,16 @@ class MovieConcierge:
         """
         self._pending_device_picker = None
 
+        # Proactively wait to respect RPM limits before calling Gemini
+        self._rpm_tracker.wait_if_needed()
+
         try:
-            response = self.chat_session.send_message(message)
-            text = response.text
+            raw_text = _call_with_retry(
+                lambda: self.chat_session.send_message(message).text,
+                label="MovieConcierge.chat",
+            )
+            self._rpm_tracker.record()
+            text = raw_text
         except Exception as exc:
             err_msg = str(exc)
             if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
@@ -366,7 +469,7 @@ class ChatConcierge:
         self.db.init_schema()
         self.country_code = country_code.upper()
         self.gemini_api_key = gemini_api_key
-        self._last_call_time: float = 0.0
+        self._rpm_tracker = _RPMTracker()
 
         genai.configure(api_key=gemini_api_key)
 
@@ -437,34 +540,21 @@ class ChatConcierge:
         Context is already in the system instruction — only the new
         user message is sent per turn.
         """
-        import time as _time
+        # Proactively wait to respect RPM limits before calling Gemini
+        self._rpm_tracker.wait_if_needed()
 
-        # Simple cooldown — 3 seconds between Gemini calls
-        now = _time.monotonic()
-        elapsed = now - self._last_call_time
-        if elapsed < 3:
-            _time.sleep(3 - elapsed)
-        self._last_call_time = _time.monotonic()
-
-        # Retry with backoff on quota errors
-        max_retries = 3
-        raw_text = ""
-        for attempt in range(max_retries):
-            try:
-                response = self.chat_session.send_message(user_message)
-                raw_text = response.text
-                break
-            except Exception as exc:
-                err_msg = str(exc)
-                if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
-                    if attempt < max_retries - 1:
-                        wait = 60  # quota resets per minute
-                        logger.warning("Gemini quota hit, retrying in %ds (attempt %d/%d)", wait, attempt + 1, max_retries)
-                        _time.sleep(wait)
-                        continue
-                    return "Gemini API quota exceeded — try again in a minute.", None
-                logger.exception("Chat concierge failed")
-                return f"Something went wrong: {err_msg}", None
+        try:
+            raw_text = _call_with_retry(
+                lambda: self.chat_session.send_message(user_message).text,
+                label="ChatConcierge.chat",
+            )
+            self._rpm_tracker.record()
+        except Exception as exc:
+            err_msg = str(exc)
+            if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
+                return "Gemini API quota exceeded — try again in a minute.", None
+            logger.exception("Chat concierge failed")
+            return f"Something went wrong: {err_msg}", None
 
         # Parse for RECOMMEND: trigger
         display_text, tmdb_ids = parse_chat_response(raw_text)
@@ -480,4 +570,3 @@ class ChatConcierge:
             system_instruction=system_instruction,
         )
         self.chat_session = self.chat_model.start_chat()
-        self._last_call_time = 0.0
