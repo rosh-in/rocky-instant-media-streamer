@@ -21,9 +21,9 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
         # Total watchlist
         total = conn.execute("SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL").fetchone()[0]
 
-        # In Jellyfin (requested_in_radarr = 1 as proxy)
+        # In Jellyfin (has_file = 1 means Radarr downloaded & imported the file)
         in_jellyfin = conn.execute(
-            "SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL AND requested_in_radarr = 1"
+            "SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL AND has_file = 1"
         ).fetchone()[0]
 
         # OTT only (not in Jellyfin but has availability)
@@ -32,7 +32,7 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
             SELECT COUNT(DISTINCT m.id)
             FROM movies m
             WHERE m.tmdb_id IS NOT NULL
-              AND m.requested_in_radarr = 0
+              AND m.has_file = 0
               AND EXISTS (
                   SELECT 1 FROM availability a
                   WHERE a.movie_id = m.id AND a.country_code = ?
@@ -47,7 +47,7 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
             SELECT COUNT(DISTINCT m.id)
             FROM movies m
             WHERE m.tmdb_id IS NOT NULL
-              AND m.requested_in_radarr = 0
+              AND m.has_file = 0
               AND NOT EXISTS (
                   SELECT 1 FROM availability a
                   WHERE a.movie_id = m.id AND a.country_code = ?
