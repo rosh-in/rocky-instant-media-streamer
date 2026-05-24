@@ -137,19 +137,25 @@ Requires `JELLYFIN_API_KEY` and `JELLYFIN_USERNAME` in `.env`. Generate an API k
 
 ### Telegram bot
 
-Chat-based movie recommendations powered by Gemini, with Jellyfin playback control:
+Conversational movie concierge powered by Gemini, with Jellyfin playback control:
 
 ```sh
-python -m project_toto.bot
+PYTHONPATH=src python -m project_toto.bot
 ```
 
-Commands:
-- `/recommend <mood>` — Get 2-3 mood-based movie picks from your watchlist
-- `/play <title>` — Search Jellyfin and pick a device (inline keyboard)
+You can chat naturally with prompts like:
+- "Something light, under 2 hours"
+- "Play Inception on my TV"
+- "Just pick something for me"
+
+Available slash commands:
+- `/start` — Show onboarding tips
+- `/reset` — Clear conversation memory
 - `/devices` — List active Jellyfin devices
 - `/status` — Show last sync run and library stats
 
 Requires `TELEGRAM_BOT_TOKEN` (from @BotFather) and `GEMINI_API_KEY` in `.env`.
+The current shared settings loader also requires `LETTERBOXD_USERNAME` and `TMDB_API_KEY` to be present when launching the bot.
 
 ## Configuration Reference
 
@@ -187,6 +193,10 @@ All configuration is done through environment variables (`.env` file):
 **Telegram Bot / Gemini**
 - `TELEGRAM_BOT_TOKEN` — Bot token from @BotFather (required for bot).
 - `GEMINI_API_KEY` — Google Gemini API key (required for recommendations).
+- `TELEGRAM_ALLOWED_USER_IDS` — Optional comma-separated Telegram user IDs allowed to use the bot (default: empty = allow all).
+- `TELEGRAM_ALLOWED_CHAT_IDS` — Optional comma-separated chat IDs allowed to use the bot (default: empty = allow all).
+- `TELEGRAM_RATE_LIMIT_WINDOW_SECONDS` — Sliding rate-limit window in seconds (default: `20`; set `0` to disable).
+- `TELEGRAM_RATE_LIMIT_MAX_MESSAGES` — Max messages allowed per window (default: `8`; set `0` to disable).
 
 ## Logging
 
@@ -236,6 +246,6 @@ project toto/
 - [x] Phase 3 — Automation & reliability (logging, retries, scheduling, status CLI)
 - [ ] Phase 4 — Bazarr + subtitle automation
 - [x] Phase 5 — Jellyfin multi-device playback control
-- [ ] Phase 6 — Telegram bot + Gemini-powered recommendations
+- [x] Phase 6 — Telegram bot + Gemini-powered recommendations
 - [ ] Phase 7 — Optional Raspberry Pi migration
 - [ ] Phase 8 — Polish and public release
