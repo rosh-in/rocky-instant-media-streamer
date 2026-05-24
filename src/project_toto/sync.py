@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from project_toto.config import load_settings
-from project_toto.db import Database
+from project_toto.db import Database, derive_mood_tags
 from project_toto.justwatch import JustWatchClient
 from project_toto.letterboxd import fetch_watchlist
 from project_toto.logging_config import setup_logging
@@ -57,6 +57,23 @@ def run_watchlist_sync() -> None:
                     db.update_trailer_key(
                         movie_id=movie_id,
                         trailer_key=trailer_key,
+                    )
+
+                # Fetch and store rich metadata (keywords, credits, etc.)
+                enrichment = tmdb_client.get_movie_enrichment(tmdb_movie.tmdb_id)
+                if enrichment:
+                    # Read genre back from DB to derive mood_tags
+                    genre = details.get("genre") if details else None
+                    mood = derive_mood_tags(genre) if genre else None
+                    db.update_movie_enrichment(
+                        movie_id=movie_id,
+                        keywords=enrichment.get("keywords"),
+                        vote_average=enrichment.get("vote_average"),
+                        director=enrichment.get("director"),
+                        cast_top3=enrichment.get("cast_top3"),
+                        collection=enrichment.get("collection"),
+                        origin_country=enrichment.get("origin_country"),
+                        mood_tags=mood,
                     )
 
         if settings.justwatch_enabled:
