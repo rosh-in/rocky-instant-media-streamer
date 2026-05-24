@@ -4,6 +4,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# Mood tags derived from genres
+MOOD_MAP = {
+    "Drama": ["emotional", "heavy", "character-driven"],
+    "Comedy": ["light", "fun", "easy watch"],
+    "Thriller": ["tense", "gripping", "edge of seat"],
+    "Horror": ["scary", "disturbing", "dark"],
+    "Romance": ["warm", "tender", "feel-good"],
+    "Animation": ["family", "light", "fun"],
+    "History": ["slow burn", "weighty", "thought-provoking"],
+    "Mystery": ["gripping", "cerebral", "twisty"],
+    "Action": ["exciting", "fast-paced", "adrenaline"],
+    "Science Fiction": ["mind-bending", "futuristic", "cerebral"],
+    "Fantasy": ["escapist", "imaginative", "epic"],
+    "Documentary": ["informative", "real", "thought-provoking"],
+    "War": ["heavy", "intense", "weighty"],
+    "Crime": ["gritty", "tense", "cerebral"],
+    "Adventure": ["exciting", "escapist", "fun"],
+}
+
+
+def derive_mood_tags(genres: str) -> str:
+    """Derive mood tags from a comma/slash-separated genre string."""
+    if not genres:
+        return ""
+    tags = []
+    # Handle both comma and slash separated genres
+    for part in genres.replace("/", ",").split(","):
+        genre = part.strip()
+        tags.extend(MOOD_MAP.get(genre, []))
+    return ",".join(sorted(set(tags)))
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -97,6 +128,15 @@ class Database:
                     retrieved_at TEXT NOT NULL,
                     FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS watch_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tmdb_id INTEGER,
+                    title TEXT,
+                    watched_at TEXT DEFAULT NULL,
+                    reaction TEXT,
+                    reaction_emoji TEXT
+                );
                 """
             )
             conn.execute(
@@ -119,6 +159,14 @@ class Database:
             self._ensure_column(conn, "movies", "genre", "TEXT")
             self._ensure_column(conn, "movies", "runtime", "INTEGER")
             self._ensure_column(conn, "movies", "trailer_key", "TEXT")
+            # Rich metadata columns for chat mode
+            self._ensure_column(conn, "movies", "keywords", "TEXT")
+            self._ensure_column(conn, "movies", "vote_average", "REAL")
+            self._ensure_column(conn, "movies", "director", "TEXT")
+            self._ensure_column(conn, "movies", "cast_top3", "TEXT")
+            self._ensure_column(conn, "movies", "mood_tags", "TEXT")
+            self._ensure_column(conn, "movies", "collection", "TEXT")
+            self._ensure_column(conn, "movies", "origin_country", "TEXT")
             self._ensure_column(
                 conn, "sync_runs", "items_availability_refreshed", "INTEGER NOT NULL DEFAULT 0"
             )
@@ -556,6 +604,146 @@ class Database:
                     "in_jellyfin": in_jellyfin,
                     "ott_platforms": ott_platforms,
                     "trailer_key": row["trailer_key"],
+                })
+            return results
+
+    def update_movie_enrichment(
+        self,
+        movie_id: int,
+        keywords: Optional[str] = None,
+        vote_average: Optional[float] = None,
+        director: Optional[str] = None,
+        cast_top3: Optional[str] = None,
+        collection: Optional[str] = None,
+        origin_country: Optional[str] = None,
+        mood_tags: Optional[str] = None,
+    ) -> None:
+        """Store rich metadata (keywords, credits, mood_tags, etc.) for a movie."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE movies
+                SET keywords = COALESCE(?, keywords),
+                    vote_average = COALESCE(?, vote_average),
+                    director = COALESCE(?, director),
+                    cast_top3 = COALESCE(?, cast_top3),
+                    mood_tags = COALESCE(?, mood_tags),
+                    collection = COALESCE(?, collection),
+                    origin_country = COALESCE(?, origin_country),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (keywords, vote_average, director, cast_top3, mood_tags,
+                 collection, origin_country, now, movie_id),
+            )
+            conn.commit()
+
+    def log_watch_history(
+        self,
+        tmdb_id: Optional[int],
+        title: Optional[str],
+        reaction: Optional[str] = None,
+        reaction_emoji: Optional[str] = None,
+    ) -> None:
+        """Log a watch event to the watch_history table."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watch_history (tmdb_id, title, watched_at, reaction, reaction_emoji)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (tmdb_id, title, now, reaction, reaction_emoji),
+            )
+            conn.commit()
+
+    def get_watched_movies(
+        self,
+        reaction: Optional[str] = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Return watched movies, optionally filtered by reaction."""
+        with self._connect() as conn:
+            if reaction:
+                rows = conn.execute(
+                    """
+                    SELECT wh.tmdb_id, wh.title, wh.reaction, m.genre, m.director,
+                           m.origin_country, m.year
+                    FROM watch_history wh
+                    LEFT JOIN movies m ON wh.tmdb_id = m.tmdb_id
+                    WHERE wh.reaction = ?
+                    ORDER BY wh.watched_at DESC
+                    LIMIT ?
+                    """,
+                    (reaction, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT wh.tmdb_id, wh.title, wh.reaction, m.genre, m.director,
+                           m.origin_country, m.year
+                    FROM watch_history wh
+                    LEFT JOIN movies m ON wh.tmdb_id = m.tmdb_id
+                    ORDER BY wh.watched_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_movies_for_chat_context(
+        self,
+        country_code: str = "IN",
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return compact movie data for the /chat context block.
+
+        Returns top movies by relevance (Jellyfin-first, then popularity)
+        with enriched metadata for Gemini reasoning.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.genre,
+                       m.runtime, m.vote_average, m.director, m.mood_tags,
+                       m.keywords, m.origin_country, m.collection,
+                       m.requested_in_radarr, m.cast_top3
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            results: list[dict] = []
+            for row in rows:
+                in_jellyfin = bool(row["requested_in_radarr"])
+                ott_rows = conn.execute(
+                    """
+                    SELECT DISTINCT provider_name
+                    FROM availability
+                    WHERE movie_id = ? AND country_code = ?
+                    """,
+                    (row["id"], country_code.upper()),
+                ).fetchall()
+                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                results.append({
+                    "tmdb_id": row["tmdb_id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "genre": row["genre"],
+                    "runtime": row["runtime"],
+                    "vote_average": row["vote_average"],
+                    "director": row["director"],
+                    "mood_tags": row["mood_tags"],
+                    "keywords": row["keywords"],
+                    "origin_country": row["origin_country"],
+                    "collection": row["collection"],
+                    "cast_top3": row["cast_top3"],
+                    "in_jellyfin": in_jellyfin,
+                    "ott_platforms": ott_platforms,
                 })
             return results
 
