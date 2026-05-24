@@ -35,6 +35,7 @@ class Settings:
     telegram_allowed_chat_ids: frozenset[int]
     telegram_rate_limit_window_seconds: int
     telegram_rate_limit_max_messages: int
+    telegram_chat_id: Optional[int]
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -139,6 +140,8 @@ def load_settings() -> Settings:
         telegram_rate_limit_max_messages = int(telegram_rate_limit_max_messages_raw)
     except ValueError as exc:
         raise ValueError("TELEGRAM_RATE_LIMIT_MAX_MESSAGES must be an integer.") from exc
+    telegram_chat_id_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    telegram_chat_id = int(telegram_chat_id_raw) if telegram_chat_id_raw else None
 
     if max_pages < 1:
         raise ValueError("LETTERBOXD_MAX_PAGES must be >= 1.")
@@ -183,4 +186,5 @@ def load_settings() -> Settings:
         telegram_allowed_chat_ids=telegram_allowed_chat_ids,
         telegram_rate_limit_window_seconds=telegram_rate_limit_window_seconds,
         telegram_rate_limit_max_messages=telegram_rate_limit_max_messages,
+        telegram_chat_id=telegram_chat_id,
     )
