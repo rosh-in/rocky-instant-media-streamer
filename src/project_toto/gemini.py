@@ -13,6 +13,7 @@ from pathlib import Path
 
 from project_toto.db import Database
 from project_toto.jellyfin import JellyfinClient
+from project_toto.taste_profile import load_taste_profile
 
 logger = logging.getLogger("project_toto.gemini")
 
@@ -277,3 +278,163 @@ class MovieConcierge:
             enable_automatic_function_calling=True
         )
         self._pending_device_picker = None
+
+
+# ---------------------------------------------------------------------------
+# Chat Concierge — conversational mode for /chat command
+# ---------------------------------------------------------------------------
+
+CHAT_SYSTEM_PROMPT = """You are a personal movie concierge with deep knowledge of the user's taste. You have access to their watchlist, watch history, and ratings.
+
+Rules:
+- Only recommend from the provided library
+- Be conversational, not listy
+- When recommending, explain why in one sentence
+- Remember everything said earlier in this conversation
+- If the user is vague, make an educated guess rather than asking too many questions
+- You can discuss films, directors, themes freely
+- When you decide to recommend, end with: RECOMMEND: [tmdb_id1, tmdb_id2, tmdb_id3]
+  (so the bot can parse it and show posters)
+- Never recommend movies not in the provided library list
+"""
+
+
+def parse_chat_response(response_text: str) -> tuple[str, Optional[list[int]]]:
+    """Parse a chat response for RECOMMEND: trigger.
+
+    Returns (display_text, tmdb_ids_or_None).
+    If RECOMMEND: is found, strips it from display text and parses the IDs.
+    """
+    if "RECOMMEND:" in response_text:
+        parts = response_text.split("RECOMMEND:")
+        display_text = parts[0].strip()
+        ids_raw = parts[1].strip()
+        try:
+            tmdb_ids = json.loads(ids_raw)
+            if isinstance(tmdb_ids, list):
+                return display_text, [int(i) for i in tmdb_ids]
+        except (json.JSONDecodeError, ValueError):
+            # Try to extract bracket content
+            match = re.search(r'\[.*?\]', ids_raw)
+            if match:
+                try:
+                    tmdb_ids = json.loads(match.group(0))
+                    if isinstance(tmdb_ids, list):
+                        return display_text, [int(i) for i in tmdb_ids]
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            logger.warning("Failed to parse RECOMMEND IDs: %s", ids_raw)
+            return display_text, None
+    return response_text, None
+
+
+def build_library_context(movies: list[dict]) -> str:
+    """Build the compact library format for Gemini's context block.
+
+    Format: [tmdb_id] Title (Year) | Director | Genre | Runtime | Rating | Mood | In Jellyfin/OTT
+    """
+    lines = []
+    for m in movies:
+        title = m.get("title", "Unknown")
+        year = m.get("year") or ""
+        year_str = f" ({year})" if year else ""
+        director = m.get("director") or ""
+        genre = m.get("genre") or ""
+        runtime = m.get("runtime") or ""
+        rating = m.get("vote_average") or ""
+        rating_str = f"{rating:.1f}" if isinstance(rating, float) else str(rating) if rating else ""
+        mood = m.get("mood_tags") or ""
+        jellyfin = "Jellyfin" if m.get("in_jellyfin") else ""
+        ott = m.get("ott_platforms") or ""
+        avail_parts = [p for p in [jellyfin, ott] if p]
+        avail = "/".join(avail_parts) if avail_parts else "unavailable"
+
+        lines.append(
+            f"[{m.get('tmdb_id', '?')}] {title}{year_str} | {director} | {genre} | "
+            f"{runtime}m | {rating_str} | {mood} | {avail}"
+        )
+    return "\n".join(lines)
+
+
+class ChatConcierge:
+    """Conversational movie concierge for /chat mode.
+
+    Unlike MovieConcierge which does structured JSON recommendations,
+    this carries a full conversation with rich context, taste profiling,
+    and a RECOMMEND: trigger for inline movie cards.
+    """
+
+    def __init__(
+        self,
+        gemini_api_key: str,
+        db_path: Path,
+        country_code: str = "IN",
+    ):
+        self.db = Database(db_path)
+        self.db.init_schema()
+        self.country_code = country_code.upper()
+        self.gemini_api_key = gemini_api_key
+
+        genai.configure(api_key=gemini_api_key)
+
+        self.chat_model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash-lite",
+            system_instruction=CHAT_SYSTEM_PROMPT,
+        )
+
+        # Conversation history (managed as Gemini's chat session)
+        self.chat_session = self.chat_model.start_chat()
+
+        # Initial context has been sent?
+        self._context_initialized = False
+
+    def _build_full_context(self) -> str:
+        """Build the full context block: taste profile + library."""
+        # Taste profile
+        taste = load_taste_profile()
+
+        # Library (compact format, top 50)
+        movies = self.db.get_movies_for_chat_context(
+            country_code=self.country_code,
+            limit=50,
+        )
+        library_text = build_library_context(movies)
+
+        context_parts = [
+            f"TASTE PROFILE:\n{taste}",
+            f"\nAVAILABLE LIBRARY:\n{library_text}",
+        ]
+        return "\n".join(context_parts)
+
+    def chat_conversational(self, user_message: str) -> tuple[str, Optional[list[int]]]:
+        """Send a user message in chat mode and get a response.
+
+        Returns (display_text, tmdb_ids_or_None).
+        On first message, sends the full context block as a setup.
+        """
+        try:
+            if not self._context_initialized:
+                # Send context as the first user message so Gemini has the library
+                context = self._build_full_context()
+                self.chat_session.send_message(context)
+                self._context_initialized = True
+
+            response = self.chat_session.send_message(user_message)
+            raw_text = response.text
+
+        except Exception as exc:
+            err_msg = str(exc)
+            if "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
+                return "Gemini API quota exceeded — try again in a minute.", None
+            logger.exception("Chat concierge failed")
+            return f"Something went wrong: {err_msg}", None
+
+        # Parse for RECOMMEND: trigger
+        display_text, tmdb_ids = parse_chat_response(raw_text)
+
+        return display_text, tmdb_ids
+
+    def reset(self) -> None:
+        """Reset conversation history for a new /chat session."""
+        self.chat_session = self.chat_model.start_chat()
+        self._context_initialized = False
