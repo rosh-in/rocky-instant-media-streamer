@@ -89,3 +89,22 @@ class RadarrClient:
         if not isinstance(movie_id, int):
             raise ValueError(f"Radarr did not return a valid movie id for tmdbId={tmdb_id}")
         return movie_id
+
+    def fetch_movie_file_status(self) -> dict[int, bool]:
+        """Fetch all movies from Radarr and return a mapping of tmdbId -> hasFile.
+
+        hasFile=True means Radarr has downloaded and imported a file for that movie,
+        i.e. it is on disk and ready for Jellyfin to pick up.
+        """
+        response = self._get("/api/v3/movie")
+        payload = response.json()
+        if not isinstance(payload, list):
+            logger.warning("Unexpected Radarr movie list response")
+            return {}
+        status: dict[int, bool] = {}
+        for movie in payload:
+            tmdb_id = movie.get("tmdbId")
+            if isinstance(tmdb_id, int):
+                status[tmdb_id] = bool(movie.get("hasFile", False))
+        logger.info("Fetched file status for %d movies from Radarr", len(status))
+        return status
