@@ -118,6 +118,7 @@ class Database:
             self._ensure_column(conn, "movies", "poster_url", "TEXT")
             self._ensure_column(conn, "movies", "genre", "TEXT")
             self._ensure_column(conn, "movies", "runtime", "INTEGER")
+            self._ensure_column(conn, "movies", "trailer_key", "TEXT")
             self._ensure_column(
                 conn, "sync_runs", "items_availability_refreshed", "INTEGER NOT NULL DEFAULT 0"
             )
@@ -373,6 +374,21 @@ class Database:
             )
             conn.commit()
 
+    def update_trailer_key(self, movie_id: int, trailer_key: Optional[str]) -> None:
+        """Store the YouTube trailer key for a movie."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE movies
+                SET trailer_key = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (trailer_key, now, movie_id),
+            )
+            conn.commit()
+
     def update_movie_details(
         self,
         movie_id: int,
@@ -401,7 +417,7 @@ class Database:
             row = conn.execute(
                 """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.requested_in_radarr
+                       m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
                 FROM movies m
                 WHERE m.tmdb_id = ?
                 """,
@@ -435,7 +451,113 @@ class Database:
                 "overview": row["tmdb_overview"],
                 "in_jellyfin": in_jellyfin,
                 "ott_platforms": ott_platforms,
+                "trailer_key": row["trailer_key"],
             }
+
+    def get_short_movies(
+        self,
+        country_code: str = "IN",
+        max_runtime: int = 90,
+        exclude_ids: Optional[list[int]] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Return movies with runtime <= max_runtime, optionally excluding tmdb_ids."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            query = """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND m.runtime IS NOT NULL
+                  AND m.runtime <= ?
+            """
+            params: list = [max_runtime]
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+            results: list[dict] = []
+            for row in rows:
+                in_jellyfin = bool(row["requested_in_radarr"])
+                ott_rows = conn.execute(
+                    """
+                    SELECT DISTINCT provider_name
+                    FROM availability
+                    WHERE movie_id = ? AND country_code = ?
+                    """,
+                    (row["id"], country_code.upper()),
+                ).fetchall()
+                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "tmdb_id": row["tmdb_id"],
+                    "poster_url": row["poster_url"],
+                    "genre": row["genre"],
+                    "runtime": row["runtime"],
+                    "overview": row["tmdb_overview"],
+                    "in_jellyfin": in_jellyfin,
+                    "ott_platforms": ott_platforms,
+                    "trailer_key": row["trailer_key"],
+                })
+            return results
+
+    def get_random_movies(
+        self,
+        country_code: str = "IN",
+        exclude_ids: Optional[list[int]] = None,
+        limit: int = 3,
+    ) -> list[dict]:
+        """Return random movies from the library, optionally excluding tmdb_ids."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            query = """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+            """
+            params: list = []
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY RANDOM() LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+            results: list[dict] = []
+            for row in rows:
+                in_jellyfin = bool(row["requested_in_radarr"])
+                ott_rows = conn.execute(
+                    """
+                    SELECT DISTINCT provider_name
+                    FROM availability
+                    WHERE movie_id = ? AND country_code = ?
+                    """,
+                    (row["id"], country_code.upper()),
+                ).fetchall()
+                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "tmdb_id": row["tmdb_id"],
+                    "poster_url": row["poster_url"],
+                    "genre": row["genre"],
+                    "runtime": row["runtime"],
+                    "overview": row["tmdb_overview"],
+                    "in_jellyfin": in_jellyfin,
+                    "ott_platforms": ott_platforms,
+                    "trailer_key": row["trailer_key"],
+                })
+            return results
 
     def get_relevant_movies(
         self,
@@ -457,7 +579,7 @@ class Database:
                 # No keywords — just return most popular
                 query = """
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                           m.runtime, m.tmdb_overview, m.requested_in_radarr
+                           m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
                     ORDER BY m.requested_in_radarr DESC, m.tmdb_popularity DESC
@@ -484,7 +606,7 @@ class Database:
 
                 query = f"""
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                           m.runtime, m.tmdb_overview, m.requested_in_radarr
+                           m.runtime, m.tmdb_overview, m.requested_in_radarr, m.trailer_key
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
                       AND ({where_clause})
@@ -519,5 +641,6 @@ class Database:
                     "overview": row["tmdb_overview"],
                     "in_jellyfin": in_jellyfin,
                     "ott_platforms": ott_platforms,
+                    "trailer_key": row["trailer_key"],
                 })
             return results
