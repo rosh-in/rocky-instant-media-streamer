@@ -9,7 +9,7 @@ from collections import deque
 from typing import Optional
 import requests
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup, KeyboardButton, Update
 from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
@@ -23,6 +23,8 @@ from project_toto.config import Settings, load_settings
 from project_toto.db import Database
 from project_toto.gemini import MovieConcierge, availability_label
 from project_toto.jellyfin import JellyfinClient
+from project_toto.stats import generate_stats
+from project_toto.tmdb import TmdbClient
 
 logger = logging.getLogger("project_toto.bot")
 
@@ -42,6 +44,22 @@ _MAX_PLAY_SESSIONS = 500
 _BLOCKING_CALL_TIMEOUT_SECONDS = 45
 
 _FALLBACK_POSTER = "https://placehold.co/500x750/1a1a2e/eee?text=No+Poster"
+
+# Persistent mood keyboard (Feature 6)
+MOOD_MAP = {
+    "🎭 Heavy": "heavy emotional drama",
+    "😂 Light": "light fun comedy",
+    "😱 Thriller": "thriller suspense",
+    "🌍 World Cinema": "non-english world cinema foreign film",
+}
+MOOD_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🎭 Heavy", "😂 Light", "😱 Thriller"],
+        ["🌍 World Cinema", "⚡ Under 90m", "🎲 Surprise me"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 def _get_concierge(chat_id: int, settings: Settings) -> MovieConcierge:
@@ -326,6 +344,41 @@ async def send_recommendations(update: Update, context: ContextTypes.DEFAULT_TYP
         ))
 
     keyboard = [num_buttons_row]
+
+    # Trailer buttons row (Feature 4)
+    # Fetch trailer keys on-demand if missing from DB
+    trailer_buttons = []
+    for i, m in enumerate(movies):
+        trailer_key = m.get("trailer_key")
+        if not trailer_key and m.get("tmdb_id"):
+            # Try fetching from TMDB API on-demand
+            try:
+                settings: Settings = context.bot_data["settings"]
+                tmdb = TmdbClient(settings.tmdb_api_key)
+                trailer_key = await asyncio.wait_for(
+                    asyncio.to_thread(tmdb.get_trailer_key, m["tmdb_id"]),
+                    timeout=10,
+                )
+                if trailer_key:
+                    # Cache in DB for future use
+                    db = Database(settings.sqlite_path)
+                    db.init_schema()
+                    await asyncio.wait_for(
+                        asyncio.to_thread(db.update_trailer_key, m["id"], trailer_key),
+                        timeout=5,
+                    )
+                    m["trailer_key"] = trailer_key
+            except Exception as exc:
+                logger.warning("On-demand trailer fetch failed for tmdb_id=%s: %s", m.get("tmdb_id"), exc)
+        if trailer_key:
+            trailer_buttons.append(InlineKeyboardButton(
+                f"▶ Trailer {i + 1}",
+                url=f"https://www.youtube.com/watch?v={trailer_key}",
+            ))
+    if trailer_buttons:
+        keyboard.append(trailer_buttons)
+
+    # Show others button
     if len(movies) >= 3:
         keyboard.append([
             InlineKeyboardButton("🔀 Show others", callback_data=json.dumps({"action": "shuffle"})),
@@ -333,12 +386,13 @@ async def send_recommendations(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="Pick one or shuffle for more:",
+        text="Pick one, watch a trailer, or shuffle for more:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
     # Store current recommendations in context for callback use
     context.user_data["current_recommendations"] = movies
+    context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
 
 
 async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, movie: dict) -> None:
@@ -429,20 +483,16 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message."""
+    """Welcome message with persistent mood keyboard."""
     if not await _guard_update(update, context):
         return
     text = (
         "Hey! I'm your movie concierge. Just tell me what you're in the mood for "
         "and I'll find something from your watchlist.\n\n"
-        "Some things you can say:\n"
-        "\"Something comforting, not too long\"\n"
-        "\"Play Inception on my TV\"\n"
-        "\"What's new on my watchlist?\"\n"
-        "\"Just pick something for me\"\n\n"
-        "Slash commands still work too: /devices, /status, /reset"
+        "Use the mood buttons below for quick picks, or just type what you want.\n\n"
+        "Slash commands: /devices, /status, /stats, /reset"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=MOOD_KEYBOARD)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -520,6 +570,49 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show watchlist progress card (Feature 2)."""
+    if not await _guard_update(update, context):
+        return
+    settings: Settings = context.bot_data["settings"]
+    try:
+        stats_text = await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_stats,
+                settings.sqlite_path,
+                settings.justwatch_country,
+            ),
+            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+        )
+        await update.message.reply_text(stats_text, parse_mode="Markdown")
+    except Exception as exc:
+        logger.exception("Stats generation failed")
+        await update.message.reply_text(
+            _friendly_error_message(exc, "I couldn't generate stats right now. Please try again.")
+        )
+
+
+async def send_weekly_stats(bot, settings: Settings) -> None:
+    """Send the weekly watchlist progress card to the configured chat (Feature 2)."""
+    chat_id = settings.telegram_chat_id
+    if not chat_id:
+        logger.warning("TELEGRAM_CHAT_ID not set — skipping weekly stats")
+        return
+    try:
+        stats_text = await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_stats,
+                settings.sqlite_path,
+                settings.justwatch_country,
+            ),
+            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+        )
+        await bot.send_message(chat_id=chat_id, text=stats_text, parse_mode="Markdown")
+        logger.info("Weekly stats card sent to chat_id=%s", chat_id)
+    except Exception as exc:
+        logger.exception("Weekly stats send failed")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Main conversational handler — routes to recommendations or playback."""
     if not await _guard_update(update, context):
@@ -533,6 +626,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_text = update.message.text or ""
+
+    # Feature 6: Intercept mood keyboard labels
+    if user_text in MOOD_MAP:
+        # Mapped moods — pass the expanded string through the normal Gemini flow
+        user_text = MOOD_MAP[user_text]
+    elif user_text == "⚡ Under 90m":
+        # Pure SQLite — skip Gemini entirely
+        async with lock:
+            await update.message.reply_text("🎬 Finding short films for you...")
+            db = Database(settings.sqlite_path)
+            db.init_schema()
+            movies = await asyncio.wait_for(
+                asyncio.to_thread(
+                    db.get_short_movies,
+                    country_code=settings.justwatch_country,
+                    max_runtime=90,
+                    exclude_ids=context.user_data.get("seen_ids", []),
+                    limit=20,
+                ),
+                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+            )
+            if not movies:
+                await update.message.reply_text("No short films in your watchlist right now.")
+                return
+            # Pick top 3 (already sorted Jellyfin-first)
+            movies = movies[:3]
+            context.user_data["seen_ids"] = context.user_data.get("seen_ids", [])
+            context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
+            context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
+            context.user_data["last_intent"] = "short films under 90 minutes"
+            await send_recommendations(update, context, movies)
+        return
+    elif user_text == "🎲 Surprise me":
+        # Pure SQLite random — skip Gemini entirely
+        async with lock:
+            await update.message.reply_text("🎬 Picking some surprises for you...")
+            db = Database(settings.sqlite_path)
+            db.init_schema()
+            movies = await asyncio.wait_for(
+                asyncio.to_thread(
+                    db.get_random_movies,
+                    country_code=settings.justwatch_country,
+                    exclude_ids=context.user_data.get("seen_ids", []),
+                    limit=3,
+                ),
+                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+            )
+            if not movies:
+                await update.message.reply_text("No movies in your library right now.")
+                return
+            context.user_data["seen_ids"] = context.user_data.get("seen_ids", [])
+            context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
+            context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
+            context.user_data["last_intent"] = "surprise me"
+            await send_recommendations(update, context, movies)
+        return
 
     # Store intent for shuffle feature
     context.user_data["last_intent"] = user_text
@@ -679,7 +828,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Track shown movies
         context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
 
-        # Send new recommendations (edit current "Pick one" message + send new media)
+        # Send new recommendations
         await query.edit_message_text("🎬 Here are some other options:")
         await send_recommendations(update, context, movies)
 
@@ -861,6 +1010,7 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("devices", cmd_devices))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stats", cmd_stats))
 
     # Recommendation inline button callback (JSON-based actions)
     app.add_handler(CallbackQueryHandler(callback_button, pattern=r'^\{".*"'))
@@ -868,6 +1018,27 @@ def run_bot() -> None:
     # Legacy play/skip button callbacks
     app.add_handler(CallbackQueryHandler(callback_play, pattern=r"^p\|"))
     app.add_handler(CallbackQueryHandler(callback_skip, pattern=r"^skip(?:\|\d+)?$"))
+
+    # Feature 2: Set up APScheduler for weekly stats card
+    if settings.telegram_chat_id:
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            scheduler = AsyncIOScheduler()
+            scheduler.add_job(
+                send_weekly_stats,
+                trigger="cron",
+                day_of_week="fri",
+                hour=18,
+                minute=0,
+                timezone="Asia/Kolkata",
+                args=[app.bot, settings],
+            )
+            scheduler.start()
+            logger.info("Weekly stats scheduler started (Friday 18:00 Asia/Kolkata)")
+        except ImportError:
+            logger.warning("apscheduler not installed — weekly stats scheduler disabled")
+    else:
+        logger.info("TELEGRAM_CHAT_ID not set — weekly stats scheduler disabled")
 
     logger.info("Starting Project Toto Telegram bot...")
     print("Project Toto bot is running. Press Ctrl+C to stop.")
