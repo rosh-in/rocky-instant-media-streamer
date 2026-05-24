@@ -38,7 +38,18 @@ def run_watchlist_sync() -> None:
             tmdb_movie = tmdb_client.enrich_movie(movie)
             if tmdb_movie:
                 enriched += 1
-            db.upsert_movie(movie, tmdb_movie)
+            movie_id = db.upsert_movie(movie, tmdb_movie)
+
+            # Fetch and store poster/genre/runtime from TMDB
+            if tmdb_movie and tmdb_movie.tmdb_id:
+                details = tmdb_client.get_movie_details(tmdb_movie.tmdb_id)
+                if details:
+                    db.update_movie_details(
+                        movie_id=movie_id,
+                        poster_url=details.get("poster_url"),
+                        genre=details.get("genre"),
+                        runtime=details.get("runtime"),
+                    )
 
         if settings.justwatch_enabled:
             justwatch = JustWatchClient(
