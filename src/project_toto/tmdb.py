@@ -156,3 +156,110 @@ class TmdbClient:
                 if key:
                     return key
         return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _get_movie_keywords(self, tmdb_id: int) -> Dict[str, Any]:
+        """Fetch keywords for a movie from /movie/{id}/keywords endpoint."""
+        params = {
+            "api_key": self.api_key,
+        }
+        response = self.session.get(
+            f"{self.base_url}/movie/{tmdb_id}/keywords", params=params, timeout=20
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _get_movie_credits(self, tmdb_id: int) -> Dict[str, Any]:
+        """Fetch credits for a movie from /movie/{id}/credits endpoint."""
+        params = {
+            "api_key": self.api_key,
+            "language": "en-US",
+        }
+        response = self.session.get(
+            f"{self.base_url}/movie/{tmdb_id}/credits", params=params, timeout=20
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_movie_enrichment(self, tmdb_id: int) -> Optional[dict]:
+        """Fetch enriched metadata for a movie by TMDB ID.
+
+        Returns a dict with keys: keywords, vote_average, director, cast_top3,
+        collection, origin_country.
+        Returns None if the API call fails entirely.
+        """
+        try:
+            # Get extended details (includes vote_average, collection, origin_country)
+            data = self._get_movie_details(tmdb_id)
+        except Exception:
+            logger.warning("Failed to fetch TMDB details for enrichment id=%s", tmdb_id)
+            return None
+
+        # Keywords
+        keywords_str = None
+        try:
+            kw_data = self._get_movie_keywords(tmdb_id)
+            kw_names = [k["name"] for k in kw_data.get("keywords", []) if k.get("name")]
+            keywords_str = ",".join(kw_names[:5]) if kw_names else None
+        except Exception:
+            logger.warning("Failed to fetch keywords for id=%s", tmdb_id)
+
+        # Credits (director + top 3 cast)
+        director = None
+        cast_top3 = None
+        try:
+            credits = self._get_movie_credits(tmdb_id)
+            # Director from crew
+            for member in credits.get("crew", []):
+                if member.get("job") == "Director" and member.get("name"):
+                    director = member["name"]
+                    break
+            # Top 3 cast
+            cast_names = [
+                c["name"] for c in credits.get("cast", [])[:3] if c.get("name")
+            ]
+            cast_top3 = ",".join(cast_names) if cast_names else None
+        except Exception:
+            logger.warning("Failed to fetch credits for id=%s", tmdb_id)
+
+        # Vote average
+        vote_average = data.get("vote_average")
+        if vote_average is not None:
+            try:
+                vote_average = float(vote_average)
+            except (ValueError, TypeError):
+                vote_average = None
+
+        # Collection (franchise)
+        collection = None
+        coll_data = data.get("belongs_to_collection")
+        if coll_data and coll_data.get("name"):
+            collection = coll_data["name"]
+
+        # Origin country
+        origin_country = None
+        countries = data.get("origin_country", [])
+        if countries:
+            origin_country = countries[0]
+
+        return {
+            "keywords": keywords_str,
+            "vote_average": vote_average,
+            "director": director,
+            "cast_top3": cast_top3,
+            "collection": collection,
+            "origin_country": origin_country,
+        }
