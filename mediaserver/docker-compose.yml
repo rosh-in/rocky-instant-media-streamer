@@ -1,4 +1,69 @@
 services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
+      - VPN_TYPE=${VPN_TYPE}
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - SERVER_COUNTRIES=${VPN_SERVER_COUNTRIES}
+      - VPN_SERVER_PUBKEY=${VPN_SERVER_PUBKEY}
+      - VPN_SERVER_ADDRESS=${VPN_SERVER_ADDRESS}
+      - VPN_SERVER_PORT=${VPN_SERVER_PORT}
+      - TZ=${TZ}
+      - FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12  # allow access to media_net
+      - FIREWALL_VPN_INPUT_PORTS=6881
+    ports:
+      # qBittorrent WebUI (proxied through VPN container)
+      - "${QBITTORRENT_WEBUI_PORT}:8080"
+      # qBittorrent torrent port
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ./config/gluetun:/gluetun
+    restart: unless-stopped
+    networks:
+      - media_net
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+      - TORRENTING_PORT=6881
+    volumes:
+      - ./config/qbittorrent:/config
+      - ./data/torrents:/data/torrents
+      - ./scripts:/scripts  # scan script
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    restart: unless-stopped
+
+  clamav:
+    image: clamav/clamav
+    container_name: clamav
+    environment:
+      - TZ=${TZ}
+      - CLAMAV_NO_CLAMD=false
+      - CLAMAV_NO_FRESHCLAMD=false
+    volumes:
+      - ./config/clamav:/var/lib/clamav
+      - ./data/torrents:/data/torrents:ro  # read-only access to scan downloads
+    ports:
+      - "${CLAMAV_PORT}:3310"
+    restart: unless-stopped
+    networks:
+      - media_net
+
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
@@ -26,26 +91,6 @@ services:
       - ./data:/data
     ports:
       - "${RADARR_PORT}:7878"
-    restart: unless-stopped
-    networks:
-      - media_net
-
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: qbittorrent
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-      - WEBUI_PORT=8080
-      - TORRENTING_PORT=6881
-    volumes:
-      - ./config/qbittorrent:/config
-      - ./data/torrents:/data/torrents
-    ports:
-      - "${QBITTORRENT_WEBUI_PORT}:8080"
-      - "6881:6881"
-      - "6881:6881/udp"
     restart: unless-stopped
     networks:
       - media_net
