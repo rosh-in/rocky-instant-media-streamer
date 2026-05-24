@@ -127,6 +127,14 @@ def run_watchlist_sync() -> None:
                             row['title'], row['tmdb_id'], exc,
                         )
 
+            # Sync has_file from Radarr so in_jellyfin reflects actual downloads
+            try:
+                file_status = radarr.fetch_movie_file_status()
+                updated = db.sync_has_file_from_radarr(file_status)
+                logger.info("Synced has_file for %d movies from Radarr", updated)
+            except Exception as exc:
+                logger.warning("Radarr has_file sync failed: %s", exc)
+
         db.finish_sync_run(
             run_id=run_id,
             status="success",
