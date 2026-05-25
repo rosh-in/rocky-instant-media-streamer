@@ -11,9 +11,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-from project_toto.db import Database
+from rocky.db import Database
 
-logger = logging.getLogger("project_toto.taste_profile")
+logger = logging.getLogger("rocky.taste_profile")
 
 # Default path for the cached taste profile
 DEFAULT_PROFILE_PATH = Path("taste_profile.txt")

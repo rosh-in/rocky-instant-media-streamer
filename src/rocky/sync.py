@@ -3,15 +3,15 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from project_toto.config import load_settings
-from project_toto.db import Database, derive_mood_tags
-from project_toto.justwatch import JustWatchClient
-from project_toto.letterboxd import fetch_watchlist
-from project_toto.logging_config import setup_logging
-from project_toto.radarr import RadarrClient
-from project_toto.tmdb import TmdbClient
+from rocky.config import load_settings
+from rocky.db import Database, derive_mood_tags
+from rocky.justwatch import JustWatchClient
+from rocky.letterboxd import fetch_watchlist
+from rocky.logging_config import setup_logging
+from rocky.radarr import RadarrClient
+from rocky.tmdb import TmdbClient
 
-logger = logging.getLogger("project_toto.sync")
+logger = logging.getLogger("rocky.sync")
 
 
 def run_watchlist_sync() -> None:

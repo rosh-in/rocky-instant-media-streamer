@@ -15,7 +15,7 @@ from tenacity import (
     wait_exponential,
 )
 
-logger = logging.getLogger("project_toto.jellyfin")
+logger = logging.getLogger("rocky.jellyfin")
 
 
 @dataclass(frozen=True)

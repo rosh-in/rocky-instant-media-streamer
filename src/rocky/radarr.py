@@ -6,7 +6,7 @@ from typing import Any, Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
-logger = logging.getLogger("project_toto.radarr")
+logger = logging.getLogger("rocky.radarr")
 
 
 class RadarrClient:

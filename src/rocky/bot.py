@@ -1,4 +1,4 @@
-"""Telegram bot for Project Toto — visual movie concierge with inline buttons."""
+"""Rocky — Telegram bot. Rocky find movie you want watch. Visual movie concierge with inline buttons."""
 
 from __future__ import annotations
 import asyncio
@@ -20,15 +20,15 @@ from telegram.ext import (
     filters,
 )
 
-from project_toto.config import Settings, load_settings
-from project_toto.db import Database
-from project_toto.gemini import MovieConcierge, ChatConcierge, availability_label
-from project_toto.jellyfin import JellyfinClient
-from project_toto.stats import generate_stats
-from project_toto.taste_profile import generate_taste_profile
-from project_toto.tmdb import TmdbClient
+from rocky.config import Settings, load_settings
+from rocky.db import Database
+from rocky.gemini import MovieConcierge, ChatConcierge, availability_label
+from rocky.jellyfin import JellyfinClient
+from rocky.stats import generate_stats
+from rocky.taste_profile import generate_taste_profile
+from rocky.tmdb import TmdbClient
 
-logger = logging.getLogger("project_toto.bot")
+logger = logging.getLogger("rocky.bot")
 
 # Per-chat concierge instances (conversation memory)
 _concierges: dict[int, MovieConcierge] = {}
@@ -229,15 +229,15 @@ def _is_rate_limited(update: Update, settings: Settings) -> bool:
 async def _notify_denied(update: Update) -> None:
     """Send a minimal denial response for unauthorized access."""
     if update.callback_query:
-        await update.callback_query.answer("This bot is private.", show_alert=True)
+        await update.callback_query.answer("Rocky not know you. Bot private.", show_alert=True)
         return
     if update.effective_message:
-        await update.effective_message.reply_text("This bot is private.")
+        await update.effective_message.reply_text("Rocky not know you. Bot private.")
 
 
 async def _notify_rate_limited(update: Update) -> None:
     """Send a short message when request rate exceeds the configured threshold."""
-    text = "Too many requests right now. Please wait a few seconds and try again."
+    text = "Too many request. Rocky need moment. Wait, try again."
     if update.callback_query:
         await update.callback_query.answer(text, show_alert=True)
         return
@@ -290,15 +290,15 @@ def _friendly_error_message(exc: Exception, fallback: str) -> str:
     """Map internal exceptions to safe user-facing messages."""
     msg = str(exc).lower()
     if isinstance(exc, asyncio.TimeoutError):
-        return "That took too long. Please try again."
+        return "Rocky wait too long. Try again?"
     if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-        return "I'm out of recommendation capacity right now. Please try again shortly."
+        return "Rocky brain full right now. Wait moment, try again."
     if isinstance(exc, requests.exceptions.Timeout) or "timed out" in msg:
-        return "One of your services timed out. Please try again."
+        return "Service timeout. Rocky try again later, yes?"
     if isinstance(exc, requests.exceptions.ConnectionError) or "connection" in msg:
-        return "I couldn't reach one of your services. Please try again in a moment."
+        return "Rocky cannot reach service. Try again soon."
     if "jellyfin user" in msg and "not found" in msg:
-        return "I couldn't find your Jellyfin user. Check JELLYFIN_USERNAME."
+        return "Jellyfin user not found. Check JELLYFIN_USERNAME."
     return fallback
 
 
@@ -425,7 +425,7 @@ async def send_recommendations(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="Pick one, watch a trailer, or shuffle for more:",
+    text="Pick one. Watch trailer. Or shuffle for more:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -511,7 +511,7 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     keyboard = InlineKeyboardMarkup(button_rows)
     await query.edit_message_text(
-        text=f"*{movie['title']}* — where do you want to watch?",
+        f"*{movie['title']}* — where you want watch?",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -526,10 +526,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard_update(update, context):
         return
     text = (
-        "Hey! I'm your movie concierge. Just tell me what you're in the mood for "
-        "and I'll find something from your watchlist.\n\n"
-        "Use the mood buttons below for quick picks, or just type what you want.\n\n"
-        "Slash commands: /devices, /status, /stats, /reset, /chat"
+        "Rocky online.\n\n"
+        "Rocky = movie friend. Rocky find movie you want watch.\n"
+        "Rocky play movie on TV or phone or laptop.\n"
+        "Rocky remember what you like. Rocky get better over time.\n\n"
+        "Tell Rocky:\n"
+        "— Mood (\"something sad\" or \"make me laugh\")\n"
+        "— Movie name (\"play Inception\")\n"
+        "— Or just talk. Rocky understand.\n\n"
+        "Fist bump. Begin?"
     )
     await update.message.reply_text(text, reply_markup=MOOD_KEYBOARD)
 
@@ -540,7 +545,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     settings: Settings = context.bot_data["settings"]
     if not settings.gemini_api_key:
-        await update.message.reply_text("GEMINI_API_KEY not configured.")
+        await update.message.reply_text("GEMINI_API_KEY not configured. Rocky brain missing.")
         return
 
     # Reset any existing chat session
@@ -557,8 +562,8 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
     ])
     await update.message.reply_text(
-        "Chat mode. Tell me what you're in the mood for, ask about anything "
-        "in your library, or just describe how you're feeling tonight.",
+        "Rocky have many movie. You have one evening. Rocky help choose.\n"
+        "Describe feeling. Rocky translate to movie. Rocky good at this.",
         reply_markup=keyboard,
     )
 
@@ -579,7 +584,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 _play_sessions.pop(key, None)
     # Also clear user_data
     context.user_data.clear()
-    await update.message.reply_text("Conversation reset. Fresh start!")
+    await update.message.reply_text("Rocky forget everything. Fresh start. — wipes brain —")
 
 
 async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -588,7 +593,7 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     settings: Settings = context.bot_data["settings"]
     if not settings.jellyfin_api_key or not settings.jellyfin_username:
-        await update.message.reply_text("Jellyfin is not fully configured yet.")
+        await update.message.reply_text("Jellyfin not configured yet. Rocky need this.")
         return
     try:
         client = JellyfinClient(
@@ -601,16 +606,16 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
         if not devices:
-            await update.message.reply_text("No active devices. Open Jellyfin on a device first.")
+            await update.message.reply_text("No active device. Open Jellyfin on device first.")
             return
-        lines = [f"Active devices ({len(devices)}):\n"]
+        lines = [f"Active device ({len(devices)}):\n"]
         for d in devices:
             lines.append(f"  • {d.label}")
         await update.message.reply_text("\n".join(lines))
     except Exception as exc:
         logger.exception("Device listing failed")
         await update.message.reply_text(
-            _friendly_error_message(exc, "I couldn't list devices right now. Please try again.")
+            _friendly_error_message(exc, "Rocky cannot list device right now. Try again.")
         )
 
 
@@ -624,17 +629,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             asyncio.to_thread(_get_sync_status_snapshot, settings),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
-        lines = ["Library status:\n"]
+        lines = ["Rocky check library status:\n"]
         if "last_sync" in status:
             lines.append(f"Last sync: {status['last_sync']}")
             lines.append(f"Status: {status['status']}")
-        lines.append(f"Total movies: {status['total_movies']}")
-        lines.append(f"Unrequested: {status['unrequested']}")
+        lines.append(f"Total movie: {status['total_movies']}")
+        lines.append(f"Not yet requested: {status['unrequested']}")
         await update.message.reply_text("\n".join(lines))
     except Exception as exc:
         logger.exception("Status request failed")
         await update.message.reply_text(
-            _friendly_error_message(exc, "I couldn't fetch status right now. Please try again.")
+            _friendly_error_message(exc, "Rocky cannot fetch status right now. Try again.")
         )
 
 
@@ -656,7 +661,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.exception("Stats generation failed")
         await update.message.reply_text(
-            _friendly_error_message(exc, "I couldn't generate stats right now. Please try again.")
+            _friendly_error_message(exc, "Rocky cannot count things right now. Try again.")
         )
 
 
@@ -690,7 +695,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lock = _get_chat_lock(chat_id)
 
     if not settings.gemini_api_key:
-        await update.message.reply_text("GEMINI_API_KEY not configured.")
+        await update.message.reply_text("GEMINI_API_KEY not configured. Rocky brain missing.")
         return
 
     user_text = update.message.text or ""
@@ -707,7 +712,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif user_text == "⚡ Under 90m":
         # Pure SQLite — skip Gemini entirely
         async with lock:
-            await update.message.reply_text("🎬 Finding short films for you...")
+            await update.message.reply_text("Rocky search short film...")
             db = Database(settings.sqlite_path)
             db.init_schema()
             movies = await asyncio.wait_for(
@@ -721,7 +726,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
             )
             if not movies:
-                await update.message.reply_text("No short films in your watchlist right now.")
+                await update.message.reply_text("No short film in watchlist right now. Rocky sad.")
                 return
             # Pick top 3 (already sorted Jellyfin-first)
             movies = movies[:3]
@@ -734,7 +739,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif user_text == "🎲 Surprise me":
         # Pure SQLite random — skip Gemini entirely
         async with lock:
-            await update.message.reply_text("🎬 Picking some surprises for you...")
+            await update.message.reply_text("Rocky pick surprise...")
             db = Database(settings.sqlite_path)
             db.init_schema()
             movies = await asyncio.wait_for(
@@ -747,7 +752,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
             )
             if not movies:
-                await update.message.reply_text("No movies in your library right now.")
+                await update.message.reply_text("No movie in library right now. Rocky sad.")
                 return
             context.user_data["seen_ids"] = context.user_data.get("seen_ids", [])
             context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
@@ -769,7 +774,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_play_request:
         # Use the tool-use chat flow for playback
         async with lock:
-            await update.message.reply_text("🎬 Finding and playing...")
+            await update.message.reply_text("Rocky process...")
 
             try:
                 concierge = _get_concierge(chat_id, settings)
@@ -813,7 +818,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         # Recommendation flow — use lean structured response
         async with lock:
-            await update.message.reply_text("🎬 Finding something for you...")
+            await update.message.reply_text("Rocky search watchlist...")
 
             try:
                 concierge = _get_concierge(chat_id, settings)
@@ -835,7 +840,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             if not movies:
                 await update.message.reply_text(
-                    "Nothing matching that in your watchlist right now. Try different words?"
+                    "No match in watchlist. Try different words?"
                 )
                 return
 
@@ -901,8 +906,8 @@ async def _handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
                 ])
-                await update.message.reply_text(display_text + "\n\n(Couldn't find those movies in your library.)", reply_markup=keyboard)
-        else:
+                await update.message.reply_text(
+                    display_text + "\n\n(Rocky cannot find those movie in library.)", reply_markup=keyboard)
             # Pure conversation — no recommendation yet
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
@@ -1019,7 +1024,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         existing = _chat_concierges.get(chat_id)
         if existing:
             existing.reset()
-        await query.edit_message_text("Exited chat mode. Back to normal — use the mood buttons or just type what you want.")
+        await query.edit_message_text("Chat mode end. Rocky here when you return. Use mood buttons or just type.")
         return
 
     if action == "pick":
@@ -1057,14 +1062,14 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         if not movies:
-            await query.edit_message_text("No more matches found. Try different words?")
+            await query.edit_message_text("No more match. Try different words?")
             return
 
         # Track shown movies
         context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
 
         # Send new recommendations
-        await query.edit_message_text("🎬 Here are some other options:")
+        await query.edit_message_text("Rocky find other option:")
         await send_recommendations(update, context, movies)
 
     elif action == "device":
@@ -1113,19 +1118,19 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
                 )
                 await query.edit_message_text(
-                    f"▶️ Playing *{movie_name}* on {device['label']}.",
+                    f"▶️ Playing *{movie_name}* on {device['label']}. Fist my bump.",
                     parse_mode="Markdown",
                 )
                 logger.info("Playback triggered via bot: %s on %s", movie_name, device["label"])
             else:
                 await query.edit_message_text(
-                    f"*{movie_name}* not found in your Jellyfin library.",
+                    f"*{movie_name}* not in Jellyfin library. Rocky sad.",
                     parse_mode="Markdown",
                 )
         except Exception as exc:
             logger.exception("Device playback failed")
             await query.edit_message_text(
-                _friendly_error_message(exc, f"Couldn't play on {device['label']}. Is the Jellyfin app open?")
+                _friendly_error_message(exc, f"Cannot play on {device['label']}. Jellyfin app open?")
             )
         finally:
             _play_sessions.pop(play_key, None)
@@ -1192,7 +1197,7 @@ async def callback_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             asyncio.to_thread(client.play, session_id=device["session_id"], item_id=item_id),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
-        await query.edit_message_text(f"▶ Playing {movie_name} on {device['label']}!")
+        await query.edit_message_text(f"▶ Playing {movie_name} on {device['label']}. Grace Rocky save movies.")
         logger.info("Playback triggered via bot: %s on %s", movie_name, device["label"])
     except Exception as exc:
         logger.exception("Callback play failed")
@@ -1216,7 +1221,7 @@ async def callback_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if len(parts) == 2 and parts[1].isdigit():
         _play_sessions.pop(int(parts[1]), None)
 
-    await query.edit_message_text("Okay, what else are you in the mood for?")
+    await query.edit_message_text("Okay. What else you want watch?")
 
 
 # ---------------------------------------------------------------------------
@@ -1225,7 +1230,7 @@ async def callback_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def run_bot() -> None:
     """Start the Telegram bot (blocking)."""
-    from project_toto.logging_config import setup_logging
+    from rocky.logging_config import setup_logging
     setup_logging()
 
     settings = load_settings()
@@ -1291,8 +1296,8 @@ def run_bot() -> None:
     else:
         logger.info("TELEGRAM_CHAT_ID not set — weekly stats scheduler disabled")
 
-    logger.info("Starting Project Toto Telegram bot...")
-    print("Project Toto bot is running. Press Ctrl+C to stop.")
+    logger.info("Rocky online. Starting Telegram bot...")
+    print("Rocky bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
 

@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
-from project_toto.db import TmdbMovie, WatchlistMovie
+from rocky.db import TmdbMovie, WatchlistMovie
 
-logger = logging.getLogger("project_toto.tmdb")
+logger = logging.getLogger("rocky.tmdb")
 
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 

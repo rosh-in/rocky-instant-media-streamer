@@ -10,7 +10,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from project_toto.config import load_settings
+from rocky.config import load_settings
 
 
 def _format_row(row: sqlite3.Row) -> str:

@@ -15,9 +15,9 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from project_toto.config import load_settings
-from project_toto.jellyfin import JellyfinClient
-from project_toto.logging_config import setup_logging
+from rocky.config import load_settings
+from rocky.jellyfin import JellyfinClient
+from rocky.logging_config import setup_logging
 
 
 def _build_client() -> JellyfinClient:

@@ -71,7 +71,7 @@ def load_settings() -> Settings:
 
     username = os.getenv("LETTERBOXD_USERNAME", "").strip()
     tmdb_api_key = os.getenv("TMDB_API_KEY", "").strip()
-    sqlite_path = Path(os.getenv("SQLITE_PATH", "data/project_toto.db"))
+    sqlite_path = Path(os.getenv("SQLITE_PATH", "data/rocky.db"))
     max_pages_raw = os.getenv("LETTERBOXD_MAX_PAGES", "5").strip()
     radarr_enabled = _as_bool(os.getenv("RADARR_ENABLED", "false"), default=False)
     radarr_url = os.getenv("RADARR_URL", "http://localhost:7878").strip().rstrip("/")

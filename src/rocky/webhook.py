@@ -1,8 +1,8 @@
 """FastAPI webhook server for Jellyfin playback events and Radarr notifications.
 
 Receives webhook POSTs and logs events to the SQLite database.
-Run via: python -m project_toto.webhook
-Or:     uvicorn project_toto.webhook:app --host 0.0.0.0 --port 8400
+Run via: python -m rocky.webhook
+Or:     uvicorn rocky.webhook:app --host 0.0.0.0 --port 8400
 """
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
-from project_toto.config import load_settings
-from project_toto.db import Database
+from rocky.config import load_settings
+from rocky.db import Database
 
-logger = logging.getLogger("project_toto.webhook")
+logger = logging.getLogger("rocky.webhook")
 
-app = FastAPI(title="Project Toto Webhooks")
+app = FastAPI(title="Rocky Webhooks")
 
 
 class PlaybackPayload(BaseModel):
@@ -161,12 +161,12 @@ async def health() -> dict:
 
 def run_webhook() -> None:
     """Start the FastAPI webhook server (blocking)."""
-    from project_toto.logging_config import setup_logging
+    from rocky.logging_config import setup_logging
     setup_logging()
 
     import uvicorn
     port = 8400
-    logger.info("Starting Project Toto webhook server on port %d", port)
+    logger.info("Starting Rocky webhook server on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 

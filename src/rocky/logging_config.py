@@ -1,4 +1,4 @@
-"""Centralized logging setup for Project Toto."""
+"""Centralized logging setup for Rocky."""
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -15,7 +15,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     """Configure root logger with console and rotating file handlers."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    root = logging.getLogger("project_toto")
+    root = logging.getLogger("rocky")
     if root.handlers:
         return  # already configured
     root.setLevel(level)

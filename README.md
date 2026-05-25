@@ -1,8 +1,8 @@
-# Project Toto
+# Rocky
 
 A zero-friction home media system — from watchlist to watching in one tap.
 
-I built Project Toto to solve a real problem in my home: the frustrating gap between "I want to watch something" and "it's actually playing on my TV." What started as a personal automation project evolved through seven iterative phases into a complete product — from infrastructure to AI-powered interaction — and became the case study I use to demonstrate how I think about building products.
+I built Rocky to solve a real problem in my home: the frustrating gap between "I want to watch something" and "it's actually playing on my TV." What started as a personal automation project evolved through seven iterative phases into a complete product — from infrastructure to AI-powered interaction — and became the case study I use to demonstrate how I think about building products.
 
 ## The Problem
 
@@ -15,7 +15,7 @@ Each step worked in isolation, but the handoffs were manual, unreliable, and slo
 
 ## The Product
 
-Project Toto eliminates every manual step in the watchlist-to-watching pipeline:
+Rocky eliminates every manual step in the watchlist-to-watching pipeline:
 
 ```
 Letterboxd Watchlist
@@ -185,7 +185,7 @@ If the VPN tunnel drops, **all torrent traffic stops** — your real IP is never
 ### 1. Clone and configure environment
 
 ```sh
-git clone <repo-url> && cd project-toto
+git clone <repo-url> && cd rocky
 cp .env.example .env
 ```
 
@@ -247,15 +247,15 @@ Exits with code 1 if the most recent run failed — useful in monitoring scripts
 ### Schedule daily syncs (macOS)
 
 ```sh
-cp scripts/dev.toto.sync.plist ~/Library/LaunchAgents/dev.toto.sync.plist
-launchctl load ~/Library/LaunchAgents/dev.toto.sync.plist
+cp scripts/dev.rocky.sync.plist ~/Library/LaunchAgents/dev.rocky.sync.plist
+launchctl load ~/Library/LaunchAgents/dev.rocky.sync.plist
 ```
 
 To uninstall:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/dev.toto.sync.plist
-rm ~/Library/LaunchAgents/dev.toto.sync.plist
+launchctl unload ~/Library/LaunchAgents/dev.rocky.sync.plist
+rm ~/Library/LaunchAgents/dev.rocky.sync.plist
 ```
 
 See `scripts/README.md` for more scheduling details.
@@ -277,7 +277,7 @@ Requires `JELLYFIN_API_KEY` and `JELLYFIN_USERNAME` in `.env`. Generate an API k
 Conversational movie concierge powered by Gemini 2.5 Flash Lite, with Jellyfin playback control:
 
 ```sh
-PYTHONPATH=src python -m project_toto.bot
+PYTHONPATH=src python -m rocky.bot
 ```
 
 You can chat naturally with prompts like:
@@ -303,7 +303,7 @@ All configuration is done through environment variables (`.env` file):
 **Core**
 - `LETTERBOXD_USERNAME` — Your Letterboxd username (required).
 - `TMDB_API_KEY` — TMDB API key for metadata enrichment (required).
-- `SQLITE_PATH` — Path to the SQLite database (default: `data/project_toto.db`).
+- `SQLITE_PATH` — Path to the SQLite database (default: `data/rocky.db`).
 - `LETTERBOXD_MAX_PAGES` — Max watchlist pages to scrape (default: `5`).
 
 **Radarr**
@@ -346,13 +346,13 @@ All external API calls (TMDB, JustWatch, Letterboxd, Radarr) include automatic r
 ## Project Structure
 
 ```
-project toto/
+Rocky/
 ├── .env.example              # env var template
 ├── PRD.md                    # product requirements
 ├── ROADMAP.md                # phased execution tracker
 ├── requirements.txt          # python dependencies
 ├── data/
-│   ├── project_toto.db       # sqlite database (gitignored)
+│   ├── rocky.db       # sqlite database (gitignored)
 │   └── logs/                 # application logs (gitignored)
 ├── mediaserver/
 │   ├── docker-compose.yml    # gluetun, qbittorrent, clamav, prowlarr, radarr, jellyfin, bazarr
@@ -365,9 +365,9 @@ project toto/
 │   ├── status.py             # sync run health checker
 │   ├── play.py               # jellyfin playback control
 │   ├── run_webhook.py        # FastAPI webhook launcher
-│   ├── dev.toto.sync.plist   # macOS launchd schedule
+│   ├── dev.rocky.sync.plist   # macOS launchd schedule
 │   └── README.md             # script + scheduling docs
-└── src/project_toto/
+└── src/rocky/
     ├── __init__.py           # package marker
     ├── config.py             # settings loader (.env → dataclass)
     ├── db.py                 # sqlite schema, sync runs, movie CRUD, mood tags

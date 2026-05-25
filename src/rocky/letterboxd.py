@@ -10,9 +10,9 @@ import requests
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
-from project_toto.db import WatchlistMovie
+from rocky.db import WatchlistMovie
 
-logger = logging.getLogger("project_toto.letterboxd")
+logger = logging.getLogger("rocky.letterboxd")
 
 LETTERBOXD_BASE = "https://letterboxd.com"
 

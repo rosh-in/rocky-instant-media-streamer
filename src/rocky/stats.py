@@ -12,7 +12,7 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
 
     Returns a Markdown-formatted string ready to send via Telegram.
     """
-    from project_toto.db import Database
+    from rocky.db import Database
 
     db = Database(db_path)
     db.init_schema()
@@ -87,13 +87,15 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
     top_genre = top_genre_row["genre"] if top_genre_row else "—"
 
     return (
-        f"📊 *Your Watchlist — Week of {date_str}*\n\n"
-        f"📋 Total: {total} films\n"
-        f"✅ Ready in Jellyfin: {in_jellyfin}\n"
-        f"🎬 OTT only: {on_ott_only}\n"
-        f"❌ Not available yet: {not_available}\n\n"
-        f"🕰 Oldest unwatched: {oldest_text}\n"
-        f"➕ Recently added: {recent_text}\n"
+        f"Rocky count things. Rocky love count things.\n\n"
+        f"📊 *Week of {date_str}*\n\n"
+        f"📋 Watchlist: {total} movie\n"
+        f"✅ Ready watch: {in_jellyfin} movie\n"
+        f"🎬 OTT only: {on_ott_only} movie\n"
+        f"❌ Not yet: {not_available} movie\n\n"
+        f"🕰 Oldest waiting: {oldest_text}\n"
+        f"Rocky recommend this one soon.\n\n"
         f"🎭 Top genre: {top_genre}\n\n"
-        f"_{in_jellyfin} films ready to watch right now._"
+        f"Seven days. Rocky observe all.\n"
+        f"_{in_jellyfin} movie ready watch right now._"
     )

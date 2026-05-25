@@ -6,9 +6,9 @@ from typing import Any, Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
-from project_toto.db import AvailabilityOffer
+from rocky.db import AvailabilityOffer
 
-logger = logging.getLogger("project_toto.justwatch")
+logger = logging.getLogger("rocky.justwatch")
 
 JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql"
 
