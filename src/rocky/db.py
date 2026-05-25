@@ -494,7 +494,8 @@ class Database:
             row = conn.execute(
                 """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
                 FROM movies m
                 WHERE m.tmdb_id = ?
                 """,
@@ -529,6 +530,8 @@ class Database:
                 "in_jellyfin": in_jellyfin,
                 "ott_platforms": ott_platforms,
                 "trailer_key": row["trailer_key"],
+                "vote_average": row["vote_average"],
+                "director": row["director"],
             }
 
     def get_short_movies(
@@ -543,7 +546,8 @@ class Database:
         with self._connect() as conn:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND m.runtime IS NOT NULL
@@ -582,6 +586,8 @@ class Database:
                     "in_jellyfin": in_jellyfin,
                     "ott_platforms": ott_platforms,
                     "trailer_key": row["trailer_key"],
+                    "vote_average": row["vote_average"],
+                    "director": row["director"],
                 })
             return results
 
@@ -596,7 +602,8 @@ class Database:
         with self._connect() as conn:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
             """
@@ -633,6 +640,8 @@ class Database:
                     "in_jellyfin": in_jellyfin,
                     "ott_platforms": ott_platforms,
                     "trailer_key": row["trailer_key"],
+                    "vote_average": row["vote_average"],
+                    "director": row["director"],
                 })
             return results
 
@@ -796,7 +805,8 @@ class Database:
                 # No keywords — just return most popular
                 query = """
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                           m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
+                           m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                           m.vote_average, m.director
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
                     ORDER BY m.has_file DESC, m.tmdb_popularity DESC
@@ -823,7 +833,8 @@ class Database:
 
                 query = f"""
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
-                           m.runtime, m.tmdb_overview, m.has_file, m.trailer_key
+                           m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                           m.vote_average, m.director
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
                       AND ({where_clause})
@@ -859,5 +870,234 @@ class Database:
                     "in_jellyfin": in_jellyfin,
                     "ott_platforms": ott_platforms,
                     "trailer_key": row["trailer_key"],
+                    "vote_average": row["vote_average"],
+                    "director": row["director"],
                 })
             return results
+
+    def _movie_row_to_dict(self, row, country_code: str = "IN") -> dict:
+        """Convert a movie query row to a full dict with availability info."""
+        with self._connect() as conn:
+            in_jellyfin = bool(row["has_file"])
+            ott_rows = conn.execute(
+                """
+                SELECT DISTINCT provider_name
+                FROM availability
+                WHERE movie_id = ? AND country_code = ?
+                """,
+                (row["id"], country_code.upper()),
+            ).fetchall()
+            ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+            return {
+                "id": row["id"],
+                "title": row["title"],
+                "year": row["year"],
+                "tmdb_id": row["tmdb_id"],
+                "poster_url": row["poster_url"],
+                "genre": row["genre"],
+                "runtime": row["runtime"],
+                "overview": row["tmdb_overview"],
+                "in_jellyfin": in_jellyfin,
+                "ott_platforms": ott_platforms,
+                "trailer_key": row["trailer_key"],
+                "vote_average": row["vote_average"],
+                "director": row["director"],
+            }
+
+    def get_movies_by_director(
+        self,
+        director: str,
+        country_code: str = "IN",
+        limit: int = 20,
+        exclude_ids: Optional[list[int]] = None,
+    ) -> list[dict]:
+        """Return movies by a director name (LIKE match)."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            query = """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND LOWER(m.director) LIKE ?
+            """
+            params: list = [f"%{director.lower()}%"]
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY m.has_file DESC, m.tmdb_popularity DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            results.append(self._movie_row_to_dict(row, country_code))
+        return results
+
+    def get_movies_by_genre(
+        self,
+        genre: str,
+        country_code: str = "IN",
+        limit: int = 20,
+        exclude_ids: Optional[list[int]] = None,
+    ) -> list[dict]:
+        """Return movies matching a genre (LIKE match on genre column)."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            query = """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND LOWER(m.genre) LIKE ?
+            """
+            params: list = [f"%{genre.lower()}%"]
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY m.has_file DESC, m.tmdb_popularity DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            results.append(self._movie_row_to_dict(row, country_code))
+        return results
+
+    def get_movies_by_mood_tags(
+        self,
+        mood_tags: list[str],
+        country_code: str = "IN",
+        limit: int = 20,
+        exclude_ids: Optional[list[int]] = None,
+    ) -> list[dict]:
+        """Return movies whose mood_tags contain any of the given tags."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            conditions = []
+            params: list = []
+            for tag in mood_tags:
+                conditions.append("LOWER(m.mood_tags) LIKE ?")
+                params.append(f"%{tag.lower()}%")
+            where_clause = " OR ".join(conditions)
+
+            query = f"""
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND ({where_clause})
+            """
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY m.has_file DESC, m.tmdb_popularity DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            results.append(self._movie_row_to_dict(row, country_code))
+        return results
+
+    def get_world_cinema_movies(
+        self,
+        country_code: str = "IN",
+        exclude_country: str = "US",
+        limit: int = 20,
+        exclude_ids: Optional[list[int]] = None,
+    ) -> list[dict]:
+        """Return movies not from the specified country (default: non-US)."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            query = """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND (m.origin_country IS NULL OR LOWER(m.origin_country) NOT LIKE ?)
+            """
+            params: list = [f"%{exclude_country.lower()}%"]
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY m.has_file DESC, m.tmdb_popularity DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            results.append(self._movie_row_to_dict(row, country_code))
+        return results
+
+    def fuzzy_search_title(
+        self,
+        query: str,
+        country_code: str = "IN",
+        limit: int = 5,
+    ) -> list[dict]:
+        """Fuzzy title search — matches if all words appear in the title.
+
+        Used for direct-play detection and specific-movie intent classification.
+        Returns full movie dicts.
+        """
+        words = query.lower().split()
+        if not words:
+            return []
+        with self._connect() as conn:
+            conditions = []
+            params: list = []
+            for w in words:
+                conditions.append("LOWER(m.title) LIKE ?")
+                params.append(f"%{w}%")
+            where_clause = " AND ".join(conditions)
+
+            sql = f"""
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND ({where_clause})
+                ORDER BY m.has_file DESC, m.tmdb_popularity DESC
+                LIMIT ?
+            """
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            results.append(self._movie_row_to_dict(row, country_code))
+        return results
+
+    def get_all_directors(self) -> list[str]:
+        """Return all unique non-null director names. Used for intent classification."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT director FROM movies WHERE director IS NOT NULL AND director != ''"
+            ).fetchall()
+            return [r["director"] for r in rows]
+
+    def get_all_genres(self) -> list[str]:
+        """Return all unique genre names (split from comma/slash-separated strings).
+        Used for intent classification.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT genre FROM movies WHERE genre IS NOT NULL AND genre != ''"
+            ).fetchall()
+            genres: set[str] = set()
+            for r in rows:
+                for part in r["genre"].replace("/", ",").split(","):
+                    g = part.strip()
+                    if g:
+                        genres.add(g.lower())
+            return list(genres)
