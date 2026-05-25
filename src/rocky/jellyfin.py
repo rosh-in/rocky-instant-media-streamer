@@ -145,10 +145,12 @@ class JellyfinClient:
 
     def play(self, session_id: str, item_id: str) -> None:
         """Instruct a session to play a specific item immediately."""
-        self._post(
-            f"Sessions/{session_id}/Playing",
-            params={"playCommand": "PlayNow", "itemIds": item_id},
-        )
+        url = f"{self.base_url}/Sessions/{session_id}/Playing"
+        params = {"playCommand": "PlayNow", "itemIds": item_id, "startPositionTicks": 0}
+        logger.info("POST %s params=%s", url, params)
+        response = self.session.post(url, params=params, timeout=30)
+        logger.info("Play response: status=%s body=%s", response.status_code, response.text[:200] if response.text else "(empty)")
+        response.raise_for_status()
         logger.info("Play command sent to session %s for item %s", session_id, item_id)
 
     def pause(self, session_id: str) -> None:
