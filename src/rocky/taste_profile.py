@@ -1,4 +1,4 @@
-"""Taste profile generator for /chat conversational mode.
+"""Taste profile generator for Gemini translator context.
 
 Reads watch_history, derives patterns (loved/liked/disliked genres,
 countries, directors), and caches the result as a text file.
@@ -76,7 +76,6 @@ def generate_taste_profile(
     Returns the profile text string.
     """
     db = Database(db_path)
-    db.init_schema()
 
     loved = db.get_watched_movies(reaction="loved", limit=10)
     liked = db.get_watched_movies(reaction="liked", limit=10)
