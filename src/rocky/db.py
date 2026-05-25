@@ -746,7 +746,8 @@ class Database:
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.genre,
                        m.runtime, m.vote_average, m.director, m.mood_tags,
                        m.keywords, m.origin_country, m.collection,
-                       m.has_file, m.cast_top3
+                       m.has_file, m.cast_top3,
+                       m.tmdb_title, m.tmdb_original_title
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                 ORDER BY m.has_file DESC, m.tmdb_popularity DESC
@@ -770,6 +771,8 @@ class Database:
                 results.append({
                     "tmdb_id": row["tmdb_id"],
                     "title": row["title"],
+                    "tmdb_title": row["tmdb_title"],
+                    "tmdb_original_title": row["tmdb_original_title"],
                     "year": row["year"],
                     "genre": row["genre"],
                     "runtime": row["runtime"],
@@ -820,9 +823,11 @@ class Database:
                 for w in words:
                     like = f"%{w}%"
                     conditions.append(
-                        "(LOWER(m.title) LIKE ? OR LOWER(m.genre) LIKE ? OR LOWER(m.tmdb_overview) LIKE ?)"
+                        "(LOWER(m.title) LIKE ? OR LOWER(m.tmdb_title) LIKE ? "
+                        "OR LOWER(m.tmdb_original_title) LIKE ? "
+                        "OR LOWER(m.genre) LIKE ? OR LOWER(m.tmdb_overview) LIKE ?)"
                     )
-                    params.extend([like, like, like])
+                    params.extend([like, like, like, like, like])
 
                 where_clause = " OR ".join(conditions)
                 exclude_clause = ""
@@ -1044,8 +1049,10 @@ class Database:
         country_code: str = "IN",
         limit: int = 5,
     ) -> list[dict]:
-        """Fuzzy title search — matches if all words appear in the title.
+        """Fuzzy title search — matches if all words appear in any title field.
 
+        Searches title, tmdb_title, and tmdb_original_title so that movies
+        known by alternate names (e.g. "Another Round" vs "Druk") are found.
         Used for direct-play detection and specific-movie intent classification.
         Returns full movie dicts.
         """
@@ -1056,8 +1063,11 @@ class Database:
             conditions = []
             params: list = []
             for w in words:
-                conditions.append("LOWER(m.title) LIKE ?")
-                params.append(f"%{w}%")
+                like = f"%{w}%"
+                conditions.append(
+                    "(LOWER(m.title) LIKE ? OR LOWER(m.tmdb_title) LIKE ? OR LOWER(m.tmdb_original_title) LIKE ?)"
+                )
+                params.extend([like, like, like])
             where_clause = " AND ".join(conditions)
 
             sql = f"""
