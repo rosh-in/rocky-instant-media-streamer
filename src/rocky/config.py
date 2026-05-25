@@ -36,6 +36,9 @@ class Settings:
     telegram_rate_limit_window_seconds: int
     telegram_rate_limit_max_messages: int
     telegram_chat_id: Optional[int]
+    adb_phone_ip: Optional[str]
+    adb_phone_package: str
+    adb_phone_activity: str
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -143,6 +146,10 @@ def load_settings() -> Settings:
     telegram_chat_id_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     telegram_chat_id = int(telegram_chat_id_raw) if telegram_chat_id_raw else None
 
+    adb_phone_ip = os.getenv("ADB_PHONE_IP", "").strip() or None
+    adb_phone_package = os.getenv("ADB_PHONE_PACKAGE", "org.jellyfin.mobile").strip()
+    adb_phone_activity = os.getenv("ADB_PHONE_ACTIVITY", "org.jellyfin.mobile.MainActivity").strip()
+
     if max_pages < 1:
         raise ValueError("LETTERBOXD_MAX_PAGES must be >= 1.")
     if radarr_quality_profile_id < 1:
@@ -187,4 +194,7 @@ def load_settings() -> Settings:
         telegram_rate_limit_window_seconds=telegram_rate_limit_window_seconds,
         telegram_rate_limit_max_messages=telegram_rate_limit_max_messages,
         telegram_chat_id=telegram_chat_id,
+        adb_phone_ip=adb_phone_ip,
+        adb_phone_package=adb_phone_package,
+        adb_phone_activity=adb_phone_activity,
     )
