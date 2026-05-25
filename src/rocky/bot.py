@@ -1,5 +1,10 @@
-"""Rocky — Telegram bot. Rocky find movie you want watch. Visual movie concierge with inline buttons."""
+"""Rocky — Telegram bot. Rocky find movie you want watch. Visual movie concierge with inline buttons.
 
+Architecture:
+- DIRECT_PLAY fast-path (local, no Gemini) → "play X" goes straight to device picker
+- RockyBrain (Gemini conversational brain) → handles everything else naturally
+- Card System (unchanged) → poster cards with navigation
+"""
 from __future__ import annotations
 import asyncio
 import json
@@ -9,7 +14,7 @@ from collections import deque
 from typing import Optional
 import requests
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup, KeyboardButton, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MenuButtonCommands, ReplyKeyboardRemove, Update
 from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
@@ -22,32 +27,41 @@ from telegram.ext import (
 
 from rocky.config import Settings, load_settings
 from rocky.db import Database
-from rocky.gemini import MovieConcierge, ChatConcierge, availability_label
+from rocky.gemini import RockyBrain
+from rocky.intent import is_direct_play, extract_play_title
 from rocky.jellyfin import JellyfinClient
+from rocky.rocky_dialogue import get_rocky_response
 from rocky.stats import generate_stats
 from rocky.taste_profile import generate_taste_profile
 from rocky.tmdb import TmdbClient
 
 logger = logging.getLogger("rocky.bot")
 
-# Per-chat concierge instances (conversation memory)
-_concierges: dict[int, MovieConcierge] = {}
-_concierge_last_used: dict[int, float] = {}
-_chat_concierges: dict[int, ChatConcierge] = {}
-_chat_concierge_last_used: dict[int, float] = {}
-_chat_locks: dict[int, asyncio.Lock] = {}
+# ---------------------------------------------------------------------------
+# State machine constants (simplified — no GATHERING states)
+# ---------------------------------------------------------------------------
+STATE_IDLE = "IDLE"
+STATE_SHOWING_CARDS = "SHOWING_CARDS"
+STATE_DEVICE_PICKING = "DEVICE_PICKING"
+STATE_PLAYING = "PLAYING"
 
 # Play session storage for inline device buttons
 _play_sessions: dict[int, dict] = {}
 _play_counter: int = 0
 _rate_limit_events: dict[int, deque[float]] = {}
 
-_CONCIERGE_TTL_SECONDS = 24 * 60 * 60
+_BLOCKING_CALL_TIMEOUT_SECONDS = 45
+_FALLBACK_POSTER = "https://placehold.co/500x750/1a1a2e/eee?text=No+Poster"
 _PLAY_SESSION_TTL_SECONDS = 15 * 60
 _MAX_PLAY_SESSIONS = 500
-_BLOCKING_CALL_TIMEOUT_SECONDS = 45
 
-_FALLBACK_POSTER = "https://placehold.co/500x750/1a1a2e/eee?text=No+Poster"
+# Per-chat brain instances (for conversation history + RPM tracking)
+_brains: dict[int, RockyBrain] = {}
+_brain_last_used: dict[int, float] = {}
+_BRAIN_TTL_SECONDS = 24 * 60 * 60
+
+# Per-chat locks
+_chat_locks: dict[int, asyncio.Lock] = {}
 
 # Reaction emoji → reaction value mapping for watch_history
 REACTION_MAP = {
@@ -59,43 +73,38 @@ REACTION_MAP = {
     "🤮": "abandoned",
 }
 
-# Persistent mood keyboard (Feature 6)
-MOOD_MAP = {
-    "🎭 Heavy": "heavy emotional drama",
-    "😂 Light": "light fun comedy",
-    "😱 Thriller": "thriller suspense",
-    "🌍 World Cinema": "non-english world cinema foreign film",
-}
-MOOD_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["🎭 Heavy", "😂 Light", "😱 Thriller"],
-        ["🌍 World Cinema", "⚡ Under 90m", "🎲 Surprise me"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
 
-
-def _get_concierge(chat_id: int, settings: Settings) -> MovieConcierge:
-    """Get or create a concierge for this chat (preserves conversation memory)."""
-    _cleanup_concierges()
-    concierge = _concierges.get(chat_id)
-    if concierge is None:
-        _concierges[chat_id] = MovieConcierge(
+# ---------------------------------------------------------------------------
+# Brain management
+# ---------------------------------------------------------------------------
+def _get_brain(chat_id: int, settings: Settings) -> RockyBrain:
+    """Get or create a RockyBrain for this chat."""
+    _cleanup_brains()
+    brain = _brains.get(chat_id)
+    if brain is None:
+        _brains[chat_id] = RockyBrain(
             gemini_api_key=settings.gemini_api_key,
             db_path=settings.sqlite_path,
-            jellyfin_url=settings.jellyfin_url,
-            jellyfin_api_key=settings.jellyfin_api_key,
-            jellyfin_username=settings.jellyfin_username,
             country_code=settings.justwatch_country,
         )
-        concierge = _concierges[chat_id]
-    _concierge_last_used[chat_id] = time.time()
-    return concierge
+        brain = _brains[chat_id]
+    _brain_last_used[chat_id] = time.time()
+    return brain
 
 
+def _cleanup_brains(now_ts: Optional[float] = None) -> None:
+    """Drop stale brain instances."""
+    now = now_ts if now_ts is not None else time.time()
+    stale = [cid for cid, ts in _brain_last_used.items() if (now - ts) > _BRAIN_TTL_SECONDS]
+    for cid in stale:
+        _brains.pop(cid, None)
+        _brain_last_used.pop(cid, None)
+
+
+# ---------------------------------------------------------------------------
+# Lock management
+# ---------------------------------------------------------------------------
 def _get_chat_lock(chat_id: int) -> asyncio.Lock:
-    """Return a per-chat lock so one chat turn is processed at a time."""
     lock = _chat_locks.get(chat_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -103,98 +112,63 @@ def _get_chat_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
-def _cleanup_concierges(now_ts: Optional[float] = None) -> None:
-    """Drop stale concierge instances to avoid unbounded memory growth."""
-    now = now_ts if now_ts is not None else time.time()
-    stale_chat_ids = [
-        chat_id
-        for chat_id, last_used in _concierge_last_used.items()
-        if (now - last_used) > _CONCIERGE_TTL_SECONDS
-    ]
-    for chat_id in stale_chat_ids:
-        _concierges.pop(chat_id, None)
-        _concierge_last_used.pop(chat_id, None)
-
-    # Also clean up chat concierges
-    stale_chat_ids = [
-        chat_id
-        for chat_id, last_used in _chat_concierge_last_used.items()
-        if (now - last_used) > _CONCIERGE_TTL_SECONDS
-    ]
-    for chat_id in stale_chat_ids:
-        _chat_concierges.pop(chat_id, None)
-        _chat_concierge_last_used.pop(chat_id, None)
-
-
+# ---------------------------------------------------------------------------
+# Play session management
+# ---------------------------------------------------------------------------
 def _cleanup_play_sessions(now_ts: Optional[float] = None) -> None:
-    """Expire old play sessions and enforce an upper bound on stored sessions."""
     now = now_ts if now_ts is not None else time.time()
-    expired_keys = [
-        key
-        for key, data in _play_sessions.items()
-        if (now - float(data.get("created_at", 0.0))) > _PLAY_SESSION_TTL_SECONDS
-    ]
-    for key in expired_keys:
-        _play_sessions.pop(key, None)
-
+    expired = [k for k, d in _play_sessions.items() if (now - float(d.get("created_at", 0.0))) > _PLAY_SESSION_TTL_SECONDS]
+    for k in expired:
+        _play_sessions.pop(k, None)
     overflow = len(_play_sessions) - _MAX_PLAY_SESSIONS
     if overflow > 0:
-        oldest_keys = sorted(
-            _play_sessions,
-            key=lambda k: float(_play_sessions[k].get("created_at", 0.0)),
-        )[:overflow]
-        for key in oldest_keys:
-            _play_sessions.pop(key, None)
+        oldest = sorted(_play_sessions, key=lambda k: float(_play_sessions[k].get("created_at", 0.0)))[:overflow]
+        for k in oldest:
+            _play_sessions.pop(k, None)
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
 def _cleanup_rate_limit_events(settings: Settings, now_ts: Optional[float] = None) -> None:
-    """Prune stale rate-limit timestamps and empty buckets."""
     window = settings.telegram_rate_limit_window_seconds
     if window <= 0 or settings.telegram_rate_limit_max_messages <= 0:
         _rate_limit_events.clear()
         return
-
     now = now_ts if now_ts is not None else time.time()
     cutoff = now - window
-    stale_keys: list[int] = []
-
+    stale: list[int] = []
     for key, timestamps in _rate_limit_events.items():
         while timestamps and timestamps[0] < cutoff:
             timestamps.popleft()
         if not timestamps:
-            stale_keys.append(key)
-
-    for key in stale_keys:
+            stale.append(key)
+    for key in stale:
         _rate_limit_events.pop(key, None)
 
 
 def _cleanup_state(settings: Settings) -> None:
-    _cleanup_concierges()
+    _cleanup_brains()
     _cleanup_play_sessions()
     _cleanup_rate_limit_events(settings=settings)
 
 
+# ---------------------------------------------------------------------------
+# Auth & rate limiting
+# ---------------------------------------------------------------------------
 def _is_authorized(update: Update, settings: Settings) -> bool:
-    """Allow all requests unless allowlists are configured."""
     if not settings.telegram_allowed_user_ids and not settings.telegram_allowed_chat_ids:
         return True
-
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = update.effective_chat.id if update.effective_chat else None
-
-    if settings.telegram_allowed_user_ids and (
-        user_id is None or user_id not in settings.telegram_allowed_user_ids
-    ):
+    if settings.telegram_allowed_user_ids and (user_id is None or user_id not in settings.telegram_allowed_user_ids):
         return False
-    if settings.telegram_allowed_chat_ids and (
-        chat_id is None or chat_id not in settings.telegram_allowed_chat_ids
-    ):
+    if settings.telegram_allowed_chat_ids and (chat_id is None or chat_id not in settings.telegram_allowed_chat_ids):
         return False
     return True
 
 
 def _rate_limit_key(update: Update) -> Optional[int]:
-    """Use user ID when possible, fallback to chat ID."""
     if update.effective_user:
         return int(update.effective_user.id)
     if update.effective_chat:
@@ -203,31 +177,25 @@ def _rate_limit_key(update: Update) -> Optional[int]:
 
 
 def _is_rate_limited(update: Update, settings: Settings) -> bool:
-    """Simple sliding-window limiter per user/chat."""
     max_messages = settings.telegram_rate_limit_max_messages
     window = settings.telegram_rate_limit_window_seconds
     if max_messages <= 0 or window <= 0:
         return False
-
     key = _rate_limit_key(update)
     if key is None:
         return False
-
     now = time.time()
     bucket = _rate_limit_events.setdefault(key, deque())
     cutoff = now - window
     while bucket and bucket[0] < cutoff:
         bucket.popleft()
-
     if len(bucket) >= max_messages:
         return True
-
     bucket.append(now)
     return False
 
 
 async def _notify_denied(update: Update) -> None:
-    """Send a minimal denial response for unauthorized access."""
     if update.callback_query:
         await update.callback_query.answer("Rocky not know you. Bot private.", show_alert=True)
         return
@@ -236,7 +204,6 @@ async def _notify_denied(update: Update) -> None:
 
 
 async def _notify_rate_limited(update: Update) -> None:
-    """Send a short message when request rate exceeds the configured threshold."""
     text = "Too many request. Rocky need moment. Wait, try again."
     if update.callback_query:
         await update.callback_query.answer(text, show_alert=True)
@@ -245,49 +212,25 @@ async def _notify_rate_limited(update: Update) -> None:
         await update.effective_message.reply_text(text)
 
 
-async def _guard_update(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    apply_rate_limit: bool = True,
-) -> bool:
-    """Authorize, rate-limit, and cleanup in-memory state for each update."""
+async def _guard_update(update: Update, context: ContextTypes.DEFAULT_TYPE, *, apply_rate_limit: bool = True) -> bool:
     settings: Settings = context.bot_data["settings"]
     _cleanup_state(settings)
-
     if not _is_authorized(update, settings):
-        logger.warning(
-            "Unauthorized bot access denied: user_id=%s chat_id=%s",
-            update.effective_user.id if update.effective_user else None,
-            update.effective_chat.id if update.effective_chat else None,
-        )
+        logger.warning("Unauthorized: user_id=%s chat_id=%s",
+                       update.effective_user.id if update.effective_user else None,
+                       update.effective_chat.id if update.effective_chat else None)
         await _notify_denied(update)
         return False
-
     if apply_rate_limit and _is_rate_limited(update, settings):
         await _notify_rate_limited(update)
         return False
-
     return True
 
 
-def _get_chat_concierge(chat_id: int, settings: Settings) -> ChatConcierge:
-    """Get or create a chat concierge for this chat (preserves conversation memory)."""
-    _cleanup_concierges()
-    concierge = _chat_concierges.get(chat_id)
-    if concierge is None:
-        _chat_concierges[chat_id] = ChatConcierge(
-            gemini_api_key=settings.gemini_api_key,
-            db_path=settings.sqlite_path,
-            country_code=settings.justwatch_country,
-        )
-        concierge = _chat_concierges[chat_id]
-    _chat_concierge_last_used[chat_id] = time.time()
-    return concierge
-
-
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 def _friendly_error_message(exc: Exception, fallback: str) -> str:
-    """Map internal exceptions to safe user-facing messages."""
     msg = str(exc).lower()
     if isinstance(exc, asyncio.TimeoutError):
         return "Rocky wait too long. Try again?"
@@ -302,146 +245,247 @@ def _friendly_error_message(exc: Exception, fallback: str) -> str:
     return fallback
 
 
-def _get_sync_status_snapshot(settings: Settings) -> dict:
-    """Read latest sync status directly from the DB."""
-    db = Database(settings.sqlite_path)
-    db.init_schema()
-    with db._connect() as conn:
-        last_run = conn.execute(
-            "SELECT started_at, status, items_seen, items_enriched, items_availability_refreshed, items_requested "
-            "FROM sync_runs ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        total = conn.execute("SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL").fetchone()[0]
-        unrequested = conn.execute(
-            "SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL AND requested_in_radarr = 0"
-        ).fetchone()[0]
+def _init_rocky_state(user_data: dict) -> None:
+    """Initialize Rocky state in user_data if not already present."""
+    if "rocky_state" not in user_data:
+        user_data["rocky_state"] = STATE_IDLE
+    if "seen_ids" not in user_data:
+        user_data["seen_ids"] = []
 
-    result = {"total_movies": total, "unrequested": unrequested}
-    if last_run:
-        result["last_sync"] = last_run["started_at"][:19]
-        result["status"] = last_run["status"]
-        result["items_seen"] = last_run["items_seen"]
-        result["items_enriched"] = last_run["items_enriched"]
-    return result
+
+def _reset_rocky_state(user_data: dict, full: bool = True) -> None:
+    """Reset Rocky state. Full reset clears everything; partial keeps seen_ids for shuffle."""
+    user_data["rocky_state"] = STATE_IDLE
+    user_data.pop("pending_play", None)
+    if full:
+        user_data["seen_ids"] = []
+        user_data.pop("last_intent", None)
+        user_data.pop("current_recommendations", None)
+        user_data.pop("current_movie_index", None)
 
 
 # ---------------------------------------------------------------------------
-# Visual recommendation helpers
+# Visual recommendation helpers (unchanged)
 # ---------------------------------------------------------------------------
+def _build_movie_caption(movie: dict) -> str:
+    year = movie.get("year") or "—"
+    genre = movie.get("genre") or "—"
+    runtime = movie.get("runtime") or "—"
+    rating = movie.get("vote_average")
+    rating_str = f"⭐ {rating:.1f}" if rating else ""
+    director = movie.get("director")
+    avail = "✅ Jellyfin" if movie.get("in_jellyfin") else f"🎬 {movie.get('ott_platforms', 'Not available')}"
+    parts = [f"*{movie['title']}* ({year})"]
+    info_parts = [f"🎬 {genre}", f"{runtime}m"]
+    if rating_str:
+        info_parts.append(rating_str)
+    parts.append(" • ".join(info_parts))
+    if director:
+        parts.append(f"🎥 {director}")
+    parts.append(avail)
+    return "\n".join(parts)
 
-async def send_recommendations(update: Update, context: ContextTypes.DEFAULT_TYPE, movies: list[dict]) -> None:
-    """Send 3 movies as a media group with formatted caption and inline buttons."""
 
-    # Build the caption (shown under the media group)
-    caption_lines = []
-    for i, m in enumerate(movies, 1):
-        avail = availability_label(m)
-        genre = m.get("genre") or "—"
-        runtime = m.get("runtime") or "—"
-        year = m.get("year") or "—"
-        caption_lines.append(
-            f"*{i}. {m['title']} ({year})*\n"
-            f"🎬 {genre} • {runtime}m\n"
-            f"{avail}"
-        )
-    caption = "\n\n".join(caption_lines)
-
-    # Build media group — caption only on first photo
-    media = []
-    for i, m in enumerate(movies):
-        poster = m.get("poster_url") or _FALLBACK_POSTER
-        media.append(InputMediaPhoto(
-            media=poster,
-            caption=caption if i == 0 else "",
-            parse_mode="Markdown",
+def _build_movie_keyboard(movie: dict, index: int, total: int) -> InlineKeyboardMarkup:
+    action_row = [
+        InlineKeyboardButton(
+            "▶ Watch Now",
+            callback_data=json.dumps({"action": "pick", "tmdb_id": movie["tmdb_id"]}),
+        ),
+    ]
+    trailer_key = movie.get("trailer_key")
+    if trailer_key:
+        action_row.append(InlineKeyboardButton(
+            "🎞 Trailer",
+            url=f"https://www.youtube.com/watch?v={trailer_key}",
         ))
+    nav_row = []
+    if index > 0:
+        nav_row.append(InlineKeyboardButton(
+            f"← {index} of {total}",
+            callback_data=json.dumps({"action": "nav", "idx": index - 1}),
+        ))
+    if index < total - 1:
+        nav_row.append(InlineKeyboardButton(
+            f"→ {index + 2} of {total}",
+            callback_data=json.dumps({"action": "nav", "idx": index + 1}),
+        ))
+    else:
+        nav_row.append(InlineKeyboardButton(
+            "🔀 Other choices",
+            callback_data=json.dumps({"action": "shuffle"}),
+        ))
+    rows = [action_row, nav_row]
+    return InlineKeyboardMarkup(rows)
 
-    chat_id = update.effective_chat.id
 
-    # Send the media group
+async def _fetch_trailer_key(movie: dict, settings: Settings) -> Optional[str]:
+    trailer_key = movie.get("trailer_key")
+    if trailer_key:
+        return trailer_key
+    if not movie.get("tmdb_id"):
+        return None
     try:
-        await context.bot.send_media_group(
-            chat_id=chat_id,
-            media=media,
+        tmdb = TmdbClient(settings.tmdb_api_key)
+        trailer_key = await asyncio.wait_for(
+            asyncio.to_thread(tmdb.get_trailer_key, movie["tmdb_id"]),
+            timeout=10,
+        )
+        if trailer_key:
+            db = Database(settings.sqlite_path)
+            await asyncio.wait_for(
+                asyncio.to_thread(db.update_trailer_key, movie["id"], trailer_key),
+                timeout=5,
+            )
+            movie["trailer_key"] = trailer_key
+        return trailer_key
+    except Exception as exc:
+        logger.warning("On-demand trailer fetch failed for tmdb_id=%s: %s", movie.get("tmdb_id"), exc)
+        return None
+
+
+async def send_first_card(update: Update, context: ContextTypes.DEFAULT_TYPE, movies: list[dict]) -> None:
+    """Send the first movie card as a photo message. Navigation edits this same message."""
+    if not movies:
+        return
+    context.user_data["current_recommendations"] = movies
+    context.user_data["current_movie_index"] = 0
+    context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
+    context.user_data["rocky_state"] = STATE_SHOWING_CARDS
+
+    movie = movies[0]
+    total = len(movies)
+    settings: Settings = context.bot_data["settings"]
+
+    await _fetch_trailer_key(movie, settings)
+
+    poster = movie.get("poster_url") or _FALLBACK_POSTER
+    caption = _build_movie_caption(movie)
+    keyboard = _build_movie_keyboard(movie, 0, total)
+
+    try:
+        await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception as exc:
+        logger.warning("Photo send failed, falling back to text: %s", exc)
+        await update.message.reply_text(text=caption, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def show_movie_card(query, context: ContextTypes.DEFAULT_TYPE, movies: list[dict], index: int) -> None:
+    """Edit the existing message in-place to show a different movie card."""
+    if not movies or index < 0 or index >= len(movies):
+        await query.edit_message_caption(caption="Invalid selection.")
+        return
+    context.user_data["current_recommendations"] = movies
+    context.user_data["current_movie_index"] = index
+
+    movie = movies[index]
+    total = len(movies)
+    settings: Settings = context.bot_data["settings"]
+
+    await _fetch_trailer_key(movie, settings)
+
+    poster = movie.get("poster_url") or _FALLBACK_POSTER
+    caption = _build_movie_caption(movie)
+    keyboard = _build_movie_keyboard(movie, index, total)
+
+    try:
+        await query.edit_message_media(
+            media=InputMediaPhoto(media=poster, caption=caption, parse_mode="Markdown"),
+            reply_markup=keyboard,
         )
     except Exception as exc:
-        logger.warning("Media group send failed, falling back to text: %s", exc)
-        # Fallback to text-only if posters fail
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="Markdown",
-        )
+        logger.warning("edit_message_media failed, trying caption: %s", exc)
+        try:
+            await query.edit_message_caption(caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as exc2:
+            logger.warning("edit_message_caption also failed: %s", exc2)
 
-    # Send inline buttons as a separate message
-    num_buttons_row = []
-    for i, m in enumerate(movies):
-        label = m["title"][:15]
-        num_buttons_row.append(InlineKeyboardButton(
-            f"{i + 1}\ufe0f\u20e3 {label}",
-            callback_data=json.dumps({"action": "pick", "idx": i}),
-        ))
 
-    keyboard = [num_buttons_row]
-
-    # Trailer buttons row (Feature 4)
-    # Fetch trailer keys on-demand if missing from DB
-    trailer_buttons = []
-    for i, m in enumerate(movies):
-        trailer_key = m.get("trailer_key")
-        if not trailer_key and m.get("tmdb_id"):
-            # Try fetching from TMDB API on-demand
+async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, movie_name: str, device: dict, play_key: int) -> None:
+    """Background task: countdown 10s then execute playback unless undone."""
+    for remaining in range(10, 0, -1):
+        await asyncio.sleep(1)
+        # Check if undone
+        if not context.user_data.get("pending_play"):
+            return
+        # Update countdown label every 2 seconds
+        if remaining % 2 == 0 and remaining > 0:
             try:
-                settings: Settings = context.bot_data["settings"]
-                tmdb = TmdbClient(settings.tmdb_api_key)
-                trailer_key = await asyncio.wait_for(
-                    asyncio.to_thread(tmdb.get_trailer_key, m["tmdb_id"]),
-                    timeout=10,
+                await context.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            f"↩ Undo — {remaining}s",
+                            callback_data=json.dumps({"action": "undo"}),
+                        ),
+                    ]]),
                 )
-                if trailer_key:
-                    # Cache in DB for future use
-                    db = Database(settings.sqlite_path)
-                    db.init_schema()
-                    await asyncio.wait_for(
-                        asyncio.to_thread(db.update_trailer_key, m["id"], trailer_key),
-                        timeout=5,
-                    )
-                    m["trailer_key"] = trailer_key
-            except Exception as exc:
-                logger.warning("On-demand trailer fetch failed for tmdb_id=%s: %s", m.get("tmdb_id"), exc)
-        if trailer_key:
-            trailer_buttons.append(InlineKeyboardButton(
-                f"▶ Trailer {i + 1}",
-                url=f"https://www.youtube.com/watch?v={trailer_key}",
-            ))
-    if trailer_buttons:
-        keyboard.append(trailer_buttons)
+            except Exception:
+                pass  # Message may have been edited by undo tap
 
-    # Show others button
-    if len(movies) >= 3:
-        keyboard.append([
-            InlineKeyboardButton("🔀 Show others", callback_data=json.dumps({"action": "shuffle"})),
-        ])
+    # Countdown finished — check if still pending
+    pending = context.user_data.get("pending_play")
+    if not pending:
+        return
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-    text="Pick one. Watch trailer. Or shuffle for more:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    settings: Settings = context.bot_data["settings"]
+    session_data = _play_sessions.get(play_key)
 
-    # Store current recommendations in context for callback use
-    context.user_data["current_recommendations"] = movies
-    context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
+    try:
+        client = JellyfinClient(
+            base_url=settings.jellyfin_url,
+            api_key=settings.jellyfin_api_key,
+            username=settings.jellyfin_username,
+        )
+        jellyfin_movies = await asyncio.wait_for(
+            asyncio.to_thread(client.search_movies, movie_name, 5),
+            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+        )
+        if jellyfin_movies:
+            item_id = jellyfin_movies[0].item_id
+            await asyncio.wait_for(
+                asyncio.to_thread(client.play, session_id=device["session_id"], item_id=item_id),
+                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+            )
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=f"▶️ Playing *{movie_name}* on {device['label']}. Fist my bump.",
+                parse_mode="Markdown",
+            )
+            logger.info("Playback triggered: %s on %s", movie_name, device["label"])
+        else:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=f"*{movie_name}* not in Jellyfin library. Rocky sad.",
+                parse_mode="Markdown",
+            )
+    except Exception as exc:
+        logger.exception("Delayed playback failed")
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=_friendly_error_message(exc, f"Cannot play on {device['label']}. Jellyfin app open?"),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    finally:
+        context.user_data.pop("pending_play", None)
+        _play_sessions.pop(play_key, None)
+        _reset_rocky_state(context.user_data, full=True)
 
 
 async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, movie: dict) -> None:
     """Show device selection buttons after user picks a movie."""
     context.user_data["selected_movie"] = movie
-
+    context.user_data["rocky_state"] = STATE_DEVICE_PICKING
     settings: Settings = context.bot_data["settings"]
     query = update.callback_query
 
-    # Fetch actual Jellyfin devices
     devices = []
     try:
         client = JellyfinClient(
@@ -453,34 +497,30 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
             asyncio.to_thread(client.list_devices),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
-        devices = [
-            {"label": d.label, "session_id": d.session_id}
-            for d in device_list
-        ]
+        devices = [{"label": d.label, "session_id": d.session_id} for d in device_list]
     except Exception as exc:
         logger.warning("Failed to list devices for picker: %s", exc)
 
     if not devices:
         if movie.get("in_jellyfin"):
-            await query.edit_message_text(
-                f"*{movie['title']}* is in your library but no devices are active. Open Jellyfin on a device first.",
+            await query.edit_message_caption(
+                caption=f"*{movie['title']}* is in your library but no devices are active. Open Jellyfin on a device first.",
                 parse_mode="Markdown",
             )
         else:
             platforms = movie.get("ott_platforms", "")
-            await query.edit_message_text(
-                f"*{movie['title']}* isn't in Jellyfin.\nAvailable on: {platforms}",
+            await query.edit_message_caption(
+                caption=f"*{movie['title']}* isn't in Jellyfin.\nAvailable on: {platforms}",
                 parse_mode="Markdown",
             )
         return
 
-    # Store device list for callback use
     global _play_counter
     _play_counter += 1
     play_key = _play_counter
     _play_sessions[play_key] = {
         "movie_name": movie["title"],
-        "item_id": None,  # Will be resolved when searching Jellyfin
+        "item_id": None,
         "devices": devices,
         "chat_id": update.effective_chat.id,
         "user_id": update.effective_user.id if update.effective_user else None,
@@ -489,14 +529,12 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
     _cleanup_play_sessions()
     context.user_data["play_key"] = play_key
 
-    # Build device buttons with emoji labels
     device_emoji_map = {"tv": "📺", "phone": "📱", "iphone": "📱", "ipad": "📱",
                         "chrome": "💻", "browser": "💻", "laptop": "💻", "desktop": "💻"}
     buttons = []
     for i, dev in enumerate(devices):
-        # Pick emoji based on device name
         dev_lower = dev["label"].lower()
-        emoji = "📺"  # default
+        emoji = "📺"
         for key, em in device_emoji_map.items():
             if key in dev_lower:
                 emoji = em
@@ -505,24 +543,34 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"{emoji} {dev['label']}",
             callback_data=json.dumps({"action": "device", "play_key": play_key, "dev_idx": i}),
         ))
-
-    # Split into rows of 2
     button_rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-
     keyboard = InlineKeyboardMarkup(button_rows)
-    await query.edit_message_text(
-        f"*{movie['title']}* — where you want watch?",
+    await query.edit_message_caption(
+        caption=f"*{movie['title']}* — where you want watch?",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Helper: look up movie dicts from tmdb_ids
 # ---------------------------------------------------------------------------
+def _lookup_movies_by_tmdb_ids(db: Database, tmdb_ids: list[int], country_code: str) -> list[dict]:
+    """Look up full movie dicts from the DB by tmdb_ids, in order."""
+    results = []
+    seen = set()
+    for tmdb_id in tmdb_ids:
+        movie = db.get_movie_by_tmdb_id(int(tmdb_id), country_code)
+        if movie and movie["tmdb_id"] not in seen:
+            results.append(movie)
+            seen.add(movie["tmdb_id"])
+    return results
 
+
+# ---------------------------------------------------------------------------
+# Handlers — Slash commands
+# ---------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message with persistent mood keyboard."""
     if not await _guard_update(update, context):
         return
     text = (
@@ -536,59 +584,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "— Or just talk. Rocky understand.\n\n"
         "Fist bump. Begin?"
     )
-    await update.message.reply_text(text, reply_markup=MOOD_KEYBOARD)
-
-
-async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Enter chat mode — free conversation with Gemini."""
-    if not await _guard_update(update, context):
-        return
-    settings: Settings = context.bot_data["settings"]
-    if not settings.gemini_api_key:
-        await update.message.reply_text("GEMINI_API_KEY not configured. Rocky brain missing.")
-        return
-
-    # Reset any existing chat session
-    chat_id = update.effective_chat.id
-    existing = _chat_concierges.get(chat_id)
-    if existing:
-        existing.reset()
-
-    context.user_data["chat_mode"] = True
-    context.user_data["chat_history"] = []
-
-    # Send welcome with exit button
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
-    ])
-    await update.message.reply_text(
-        "Rocky have many movie. You have one evening. Rocky help choose.\n"
-        "Describe feeling. Rocky translate to movie. Rocky good at this.",
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reset conversation memory."""
     if not await _guard_update(update, context):
         return
     chat_id = update.effective_chat.id
     lock = _get_chat_lock(chat_id)
     async with lock:
-        concierge = _concierges.pop(chat_id, None)
-        _concierge_last_used.pop(chat_id, None)
-        if concierge:
-            concierge.reset()
         for key, session in list(_play_sessions.items()):
             if session.get("chat_id") == chat_id:
                 _play_sessions.pop(key, None)
-    # Also clear user_data
-    context.user_data.clear()
-    await update.message.reply_text("Rocky forget everything. Fresh start. — wipes brain —")
+    _reset_rocky_state(context.user_data, full=True)
+    # Also reset the brain's conversation history
+    settings: Settings = context.bot_data["settings"]
+    brain = _brains.get(chat_id)
+    if brain:
+        brain.reset()
+    await update.message.reply_text(get_rocky_response("reset"))
 
 
 async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List active Jellyfin devices (power-user shortcut)."""
     if not await _guard_update(update, context):
         return
     settings: Settings = context.bot_data["settings"]
@@ -596,15 +613,8 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Jellyfin not configured yet. Rocky need this.")
         return
     try:
-        client = JellyfinClient(
-            base_url=settings.jellyfin_url,
-            api_key=settings.jellyfin_api_key,
-            username=settings.jellyfin_username,
-        )
-        devices = await asyncio.wait_for(
-            asyncio.to_thread(client.list_devices),
-            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-        )
+        client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
+        devices = await asyncio.wait_for(asyncio.to_thread(client.list_devices), timeout=_BLOCKING_CALL_TIMEOUT_SECONDS)
         if not devices:
             await update.message.reply_text("No active device. Open Jellyfin on device first.")
             return
@@ -614,70 +624,57 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("\n".join(lines))
     except Exception as exc:
         logger.exception("Device listing failed")
-        await update.message.reply_text(
-            _friendly_error_message(exc, "Rocky cannot list device right now. Try again.")
-        )
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot list device right now. Try again."))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show sync status (power-user shortcut)."""
     if not await _guard_update(update, context):
         return
     settings: Settings = context.bot_data["settings"]
     try:
-        status = await asyncio.wait_for(
-            asyncio.to_thread(_get_sync_status_snapshot, settings),
-            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-        )
+        db = Database(settings.sqlite_path)
+        with db._connect() as conn:
+            last_run = conn.execute(
+                "SELECT started_at, status, items_seen, items_enriched, items_availability_refreshed, items_requested "
+                "FROM sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            total = conn.execute("SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL").fetchone()[0]
+            unrequested = conn.execute("SELECT COUNT(*) FROM movies WHERE tmdb_id IS NOT NULL AND requested_in_radarr = 0").fetchone()[0]
         lines = ["Rocky check library status:\n"]
-        if "last_sync" in status:
-            lines.append(f"Last sync: {status['last_sync']}")
-            lines.append(f"Status: {status['status']}")
-        lines.append(f"Total movie: {status['total_movies']}")
-        lines.append(f"Not yet requested: {status['unrequested']}")
+        if last_run:
+            lines.append(f"Last sync: {last_run['started_at'][:19]}")
+            lines.append(f"Status: {last_run['status']}")
+        lines.append(f"Total movie: {total}")
+        lines.append(f"Not yet requested: {unrequested}")
         await update.message.reply_text("\n".join(lines))
     except Exception as exc:
         logger.exception("Status request failed")
-        await update.message.reply_text(
-            _friendly_error_message(exc, "Rocky cannot fetch status right now. Try again.")
-        )
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot fetch status right now. Try again."))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show watchlist progress card (Feature 2)."""
     if not await _guard_update(update, context):
         return
     settings: Settings = context.bot_data["settings"]
     try:
         stats_text = await asyncio.wait_for(
-            asyncio.to_thread(
-                generate_stats,
-                settings.sqlite_path,
-                settings.justwatch_country,
-            ),
+            asyncio.to_thread(generate_stats, settings.sqlite_path, settings.justwatch_country),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
         await update.message.reply_text(stats_text, parse_mode="Markdown")
     except Exception as exc:
         logger.exception("Stats generation failed")
-        await update.message.reply_text(
-            _friendly_error_message(exc, "Rocky cannot count things right now. Try again.")
-        )
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot count things right now. Try again."))
 
 
 async def send_weekly_stats(bot, settings: Settings) -> None:
-    """Send the weekly watchlist progress card to the configured chat (Feature 2)."""
     chat_id = settings.telegram_chat_id
     if not chat_id:
         logger.warning("TELEGRAM_CHAT_ID not set — skipping weekly stats")
         return
     try:
         stats_text = await asyncio.wait_for(
-            asyncio.to_thread(
-                generate_stats,
-                settings.sqlite_path,
-                settings.justwatch_country,
-            ),
+            asyncio.to_thread(generate_stats, settings.sqlite_path, settings.justwatch_country),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
         await bot.send_message(chat_id=chat_id, text=stats_text, parse_mode="Markdown")
@@ -686,8 +683,11 @@ async def send_weekly_stats(bot, settings: Settings) -> None:
         logger.exception("Weekly stats send failed")
 
 
+# ---------------------------------------------------------------------------
+# Main message handler — simplified with Gemini brain
+# ---------------------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Main conversational handler — routes to chat mode or recommendations."""
+    """Main conversational handler — routes through Gemini brain."""
     if not await _guard_update(update, context):
         return
     settings: Settings = context.bot_data["settings"]
@@ -699,310 +699,244 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_text = update.message.text or ""
-
-    # Chat mode — route to conversational handler
-    if context.user_data.get("chat_mode"):
-        await _handle_chat_message(update, context, user_text)
+    if not user_text.strip():
         return
 
-    # Feature 6: Intercept mood keyboard labels
-    if user_text in MOOD_MAP:
-        # Mapped moods — pass the expanded string through the normal Gemini flow
-        user_text = MOOD_MAP[user_text]
-    elif user_text == "⚡ Under 90m":
-        # Pure SQLite — skip Gemini entirely
-        async with lock:
-            await update.message.reply_text("Rocky search short film...")
+    _init_rocky_state(context.user_data)
+    state = context.user_data["rocky_state"]
+
+    async with lock:
+        # ------------------------------------------------------------------
+        # Fast path: DIRECT_PLAY — "play X", "watch X" → skip Gemini
+        # ------------------------------------------------------------------
+        if is_direct_play(user_text) and state not in (STATE_DEVICE_PICKING, STATE_PLAYING):
+            play_title = extract_play_title(user_text)
             db = Database(settings.sqlite_path)
-            db.init_schema()
-            movies = await asyncio.wait_for(
-                asyncio.to_thread(
-                    db.get_short_movies,
-                    country_code=settings.justwatch_country,
-                    max_runtime=90,
-                    exclude_ids=context.user_data.get("seen_ids", []),
-                    limit=20,
-                ),
+            matches = await asyncio.wait_for(
+                asyncio.to_thread(db.fuzzy_search_title, play_title, settings.justwatch_country, 5),
                 timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
             )
-            if not movies:
-                await update.message.reply_text("No short film in watchlist right now. Rocky sad.")
-                return
-            # Pick top 3 (already sorted Jellyfin-first)
-            movies = movies[:3]
-            context.user_data["seen_ids"] = context.user_data.get("seen_ids", [])
-            context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
-            context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
-            context.user_data["last_intent"] = "short films under 90 minutes"
-            await send_recommendations(update, context, movies)
-        return
-    elif user_text == "🎲 Surprise me":
-        # Pure SQLite random — skip Gemini entirely
-        async with lock:
-            await update.message.reply_text("Rocky pick surprise...")
-            db = Database(settings.sqlite_path)
-            db.init_schema()
-            movies = await asyncio.wait_for(
-                asyncio.to_thread(
-                    db.get_random_movies,
-                    country_code=settings.justwatch_country,
-                    exclude_ids=context.user_data.get("seen_ids", []),
-                    limit=3,
-                ),
-                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-            )
-            if not movies:
-                await update.message.reply_text("No movie in library right now. Rocky sad.")
-                return
-            context.user_data["seen_ids"] = context.user_data.get("seen_ids", [])
-            context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
-            context.user_data["last_shown_genres"] = [m.get("genre", "") for m in movies]
-            context.user_data["last_intent"] = "surprise me"
-            await send_recommendations(update, context, movies)
-        return
-
-    # Store intent for shuffle feature
-    context.user_data["last_intent"] = user_text
-    context.user_data["seen_ids"] = context.user_data.get("seen_ids", [])
-
-    # Check if this is a playback request (contains "play" + movie name)
-    is_play_request = any(
-        keyword in user_text.lower()
-        for keyword in ["play", "watch on", "put on", "start"]
-    )
-
-    if is_play_request:
-        # Use the tool-use chat flow for playback
-        async with lock:
-            await update.message.reply_text("Rocky process...")
-
-            try:
-                concierge = _get_concierge(chat_id, settings)
-                response_text, device_picker = await asyncio.wait_for(
-                    asyncio.to_thread(concierge.chat, user_text),
-                    timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-                )
-                _concierge_last_used[chat_id] = time.time()
-            except Exception as exc:
-                logger.exception("Concierge chat failed")
-                await update.message.reply_text(
-                    _friendly_error_message(exc, "Something went wrong. Please try again.")
-                )
-                return
-
-            # If Gemini wants a device picker, show inline buttons
-            if device_picker:
+            if len(matches) == 1:
+                # Exactly one match — go straight to device picker
+                movie = matches[0]
+                context.user_data["selected_movie"] = movie
+                context.user_data["rocky_state"] = STATE_DEVICE_PICKING
+                await update.message.reply_text(get_rocky_response("play_direct", title=movie["title"]))
+                # Send poster card
+                poster = movie.get("poster_url") or _FALLBACK_POSTER
+                caption = _build_movie_caption(movie)
+                await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown")
+                # Show device picker
+                try:
+                    client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
+                    device_list = await asyncio.wait_for(asyncio.to_thread(client.list_devices), timeout=_BLOCKING_CALL_TIMEOUT_SECONDS)
+                    devices = [{"label": d.label, "session_id": d.session_id} for d in device_list]
+                except Exception:
+                    devices = []
+                if not devices:
+                    await update.message.reply_text(get_rocky_response("no_devices"))
+                    _reset_rocky_state(context.user_data, full=True)
+                    return
                 global _play_counter
                 _play_counter += 1
                 play_key = _play_counter
                 _play_sessions[play_key] = {
-                    **device_picker,
-                    "chat_id": chat_id,
+                    "movie_name": movie["title"], "item_id": None,
+                    "devices": devices, "chat_id": chat_id,
                     "user_id": update.effective_user.id if update.effective_user else None,
                     "created_at": time.time(),
                 }
                 _cleanup_play_sessions()
-
+                context.user_data["play_key"] = play_key
+                device_emoji_map = {"tv": "📺", "phone": "📱", "iphone": "📱", "ipad": "📱",
+                                    "chrome": "💻", "browser": "💻", "laptop": "💻", "desktop": "💻"}
                 buttons = []
-                for i, dev in enumerate(device_picker["devices"]):
-                    callback_data = f"p|{play_key}|{i}"
-                    buttons.append([InlineKeyboardButton(
-                        f"▶ {dev['label']}", callback_data=callback_data
-                    )])
-                buttons.append([InlineKeyboardButton("Not this one", callback_data=f"skip|{play_key}")])
-
-                keyboard = InlineKeyboardMarkup(buttons)
-                await update.message.reply_text(response_text, reply_markup=keyboard)
+                for i, dev in enumerate(devices):
+                    dev_lower = dev["label"].lower()
+                    emoji = "📺"
+                    for key, em in device_emoji_map.items():
+                        if key in dev_lower:
+                            emoji = em
+                            break
+                    buttons.append(InlineKeyboardButton(
+                        f"{emoji} {dev['label']}",
+                        callback_data=json.dumps({"action": "device", "play_key": play_key, "dev_idx": i}),
+                    ))
+                button_rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                keyboard = InlineKeyboardMarkup(button_rows)
+                await update.message.reply_text(
+                    f"*{movie['title']}* — where you want watch?",
+                    parse_mode="Markdown", reply_markup=keyboard,
+                )
+            elif len(matches) > 1:
+                # Multiple matches — show cards
+                await update.message.reply_text(get_rocky_response("play_ambiguous"))
+                await send_first_card(update, context, matches[:3])
             else:
-                await update.message.reply_text(response_text)
-    else:
-        # Recommendation flow — use lean structured response
-        async with lock:
-            await update.message.reply_text("Rocky search watchlist...")
-
-            try:
-                concierge = _get_concierge(chat_id, settings)
-                movies = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        concierge.recommend,
-                        user_text,
-                        context.user_data.get("seen_ids", []),
-                    ),
-                    timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-                )
-                _concierge_last_used[chat_id] = time.time()
-            except Exception as exc:
-                logger.exception("Recommendation failed")
-                await update.message.reply_text(
-                    _friendly_error_message(exc, "Something went wrong. Please try again.")
-                )
-                return
-
-            if not movies:
-                await update.message.reply_text(
-                    "No match in watchlist. Try different words?"
-                )
-                return
-
-            # Track shown movies to avoid reshowing on shuffle
-            context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
-
-            await send_recommendations(update, context, movies)
-
-
-async def _handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
-    """Handle messages in /chat mode — conversational Gemini with RECOMMEND: parsing."""
-    settings: Settings = context.bot_data["settings"]
-    chat_id = update.effective_chat.id
-    lock = _get_chat_lock(chat_id)
-
-    async with lock:
-        try:
-            chat_concierge = _get_chat_concierge(chat_id, settings)
-            display_text, tmdb_ids = await asyncio.wait_for(
-                asyncio.to_thread(chat_concierge.chat_conversational, user_text),
-                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-            )
-            _chat_concierge_last_used[chat_id] = time.time()
-        except Exception as exc:
-            logger.exception("Chat concierge failed")
-            await update.message.reply_text(
-                _friendly_error_message(exc, "Something went wrong in chat mode. Please try again.")
-            )
+                # Not found locally — fall through to Gemini brain
+                await _handle_with_brain(update, context, chat_id, settings, user_text)
             return
 
-        # Update conversation history in user_data
-        history = context.user_data.get("chat_history", [])
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "model", "content": display_text})
-        # Keep last 20 entries
-        context.user_data["chat_history"] = history[-20:]
+        # ------------------------------------------------------------------
+        # STATE: DEVICE_PICKING or PLAYING — ignore new text
+        # ------------------------------------------------------------------
+        if state in (STATE_DEVICE_PICKING, STATE_PLAYING):
+            await update.message.reply_text("Pick device first. Or type /reset to start over.")
+            return
 
-        if tmdb_ids:
-            # Gemini recommended movies — show them with posters
-            movies = []
-            for tid in tmdb_ids:
-                movie = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        Database(settings.sqlite_path).get_movie_by_tmdb_id,
-                        tid, settings.justwatch_country,
-                    ),
-                    timeout=10,
-                )
-                if movie:
-                    movies.append(movie)
-
-            if movies:
-                # Send the conversational text first
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
-                ])
-                await update.message.reply_text(display_text, reply_markup=keyboard)
-                # Then send recommendation cards
-                context.user_data["current_recommendations"] = movies
-                await send_recommendations(update, context, movies)
-            else:
-                # IDs didn't resolve — just show the text
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
-                ])
-                await update.message.reply_text(
-                    display_text + "\n\n(Rocky cannot find those movie in library.)", reply_markup=keyboard)
-            # Pure conversation — no recommendation yet
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Exit chat mode", callback_data=json.dumps({"action": "exit_chat"}))]
-            ])
-            await update.message.reply_text(display_text, reply_markup=keyboard)
+        # ------------------------------------------------------------------
+        # Everything else → Gemini brain (handles IDLE and SHOWING_CARDS)
+        # ------------------------------------------------------------------
+        await _handle_with_brain(update, context, chat_id, settings, user_text)
 
 
-async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle message reactions — map emoji to watch_history."""
-    if not await _guard_update(update, context, apply_rate_limit=False):
-        return
-    settings: Settings = context.bot_data["settings"]
+async def _handle_with_brain(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    settings: Settings,
+    user_text: str,
+) -> None:
+    """Send user message to Gemini brain and render the response."""
+    brain = _get_brain(chat_id, settings)
+    seen_ids = context.user_data.get("seen_ids", [])
 
-    # MessageReactionHandler provides update.message_reaction (MessageReactionUpdated)
-    reaction_update = update.message_reaction
-    if not reaction_update:
-        return
-
-    # Get current recommendations to find the movie this reaction applies to
+    # If we're showing cards, tell the brain about previously shown movies
+    # so it doesn't re-recommend them
     current_recs = context.user_data.get("current_recommendations", [])
+    if current_recs:
+        shown_from_cards = [m.get("tmdb_id") for m in current_recs if m.get("tmdb_id")]
+        seen_ids = list(set(seen_ids + shown_from_cards))
 
-    # Process each new reaction in the list
-    for reaction in (reaction_update.new_reaction or []):
-        # ReactionTypeEmoji has .emoji; ReactionTypeCustomEmoji does not
-        emoji = getattr(reaction, 'emoji', None)
-        if not emoji:
-            continue
-        reaction_value = REACTION_MAP.get(emoji)
-        if not reaction_value:
-            continue
+    # Send immediate loading indicator
+    loading_msg = await update.message.reply_text("🪨 Rocky process...")
 
-        # Try to find which movie was reacted to
-        # If we have recent recommendations, log the first one as a guess
-        # (Telegram doesn't tell us which specific message was reacted to easily)
-        if current_recs:
-            # Log for the most recent recommendation set
-            for movie in current_recs:
-                db = Database(settings.sqlite_path)
-                db.init_schema()
-                await asyncio.to_thread(
-                    db.log_watch_history,
-                    tmdb_id=movie.get("tmdb_id"),
-                    title=movie.get("title"),
-                    reaction=reaction_value,
-                    reaction_emoji=emoji,
-                )
-            logger.info("Logged reaction %s (%s) for %d movies", emoji, reaction_value, len(current_recs))
-
-
-async def cmd_watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manual watch logging: /watched <movie title>"""
-    if not await _guard_update(update, context):
-        return
-    settings: Settings = context.bot_data["settings"]
-
-    # Parse the title from the command args
-    title = " ".join(context.args or []).strip() if context.args else ""
-    if not title:
-        await update.message.reply_text("Usage: /watched <movie title>\nExample: /watched Parasite")
+    # Call Gemini brain
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                brain.chat,
+                user_text,
+                shown_ids=seen_ids,
+            ),
+            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.exception("Gemini brain call failed")
+        try:
+            await loading_msg.edit_text(_friendly_error_message(exc, "Rocky brain not working. Try again?"))
+        except Exception:
+            await update.message.reply_text(_friendly_error_message(exc, "Rocky brain not working. Try again?"))
         return
 
-    # Try to find the movie in the DB
-    db = Database(settings.sqlite_path)
-    db.init_schema()
+    reply = result.get("reply", "Rocky thinking...")
+    action = result.get("action", "ask")
+    tmdb_ids = result.get("tmdb_ids", [])
 
-    # Search by title
-    with db._connect() as conn:
-        row = conn.execute(
-            "SELECT tmdb_id, title FROM movies WHERE LOWER(title) LIKE ? AND tmdb_id IS NOT NULL LIMIT 1",
-            (f"%{title.lower()}%",),
-        ).fetchone()
+    # Helper to replace the loading indicator with text
+    async def _replace_loading(text: str, **kwargs) -> None:
+        try:
+            await loading_msg.edit_text(text, **kwargs)
+        except Exception:
+            await update.message.reply_text(text, **kwargs)
 
-    if row:
-        await asyncio.to_thread(
-            db.log_watch_history,
-            tmdb_id=row["tmdb_id"],
-            title=row["title"],
-            reaction="liked",
-            reaction_emoji="👍",
-        )
-        await update.message.reply_text(f"Logged *{row['title']}* as watched 👍", parse_mode="Markdown")
-    else:
-        # Log even if not in DB
-        await asyncio.to_thread(
-            db.log_watch_history,
-            tmdb_id=None,
-            title=title,
-            reaction="liked",
-            reaction_emoji="👍",
-        )
-        await update.message.reply_text(f"Logged *{title}* as watched (not in your library)", parse_mode="Markdown")
+    # Helper to delete the loading indicator (before sending photos/cards)
+    async def _delete_loading() -> None:
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+    # Render the response based on action
+    if action == "play" and tmdb_ids:
+        # Gemini says the user wants to play a specific movie
+        # Parallelize: fetch movie + Jellyfin devices at the same time
+        db = Database(settings.sqlite_path)
+
+        async def _fetch_movie():
+            return await asyncio.to_thread(db.get_movie_by_tmdb_id, int(tmdb_ids[0]), settings.justwatch_country)
+
+        async def _fetch_devices():
+            try:
+                client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
+                device_list = await asyncio.wait_for(asyncio.to_thread(client.list_devices), timeout=_BLOCKING_CALL_TIMEOUT_SECONDS)
+                return [{"label": d.label, "session_id": d.session_id} for d in device_list]
+            except Exception:
+                return []
+
+        movie, devices = await asyncio.gather(_fetch_movie(), _fetch_devices())
+
+        if movie:
+            context.user_data["selected_movie"] = movie
+            context.user_data["rocky_state"] = STATE_DEVICE_PICKING
+            await _replace_loading(reply)
+            # Show poster + device picker
+            poster = movie.get("poster_url") or _FALLBACK_POSTER
+            caption = _build_movie_caption(movie)
+            await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown")
+            if not devices:
+                await update.message.reply_text(get_rocky_response("no_devices"))
+                _reset_rocky_state(context.user_data, full=True)
+                return
+            global _play_counter
+            _play_counter += 1
+            play_key = _play_counter
+            _play_sessions[play_key] = {
+                "movie_name": movie["title"], "item_id": None,
+                "devices": devices, "chat_id": chat_id,
+                "user_id": update.effective_user.id if update.effective_user else None,
+                "created_at": time.time(),
+            }
+            _cleanup_play_sessions()
+            context.user_data["play_key"] = play_key
+            device_emoji_map = {"tv": "📺", "phone": "📱", "iphone": "📱", "ipad": "📱",
+                                "chrome": "💻", "browser": "💻", "laptop": "💻", "desktop": "💻"}
+            buttons = []
+            for i, dev in enumerate(devices):
+                dev_lower = dev["label"].lower()
+                emoji = "📺"
+                for key, em in device_emoji_map.items():
+                    if key in dev_lower:
+                        emoji = em
+                        break
+                buttons.append(InlineKeyboardButton(
+                    f"{emoji} {dev['label']}",
+                    callback_data=json.dumps({"action": "device", "play_key": play_key, "dev_idx": i}),
+                ))
+            button_rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+            keyboard = InlineKeyboardMarkup(button_rows)
+            await update.message.reply_text(
+                f"*{movie['title']}* — where you want watch?",
+                parse_mode="Markdown", reply_markup=keyboard,
+            )
+        else:
+            # Movie not in DB — just send the reply
+            await _replace_loading(reply)
+        return
+
+    if action == "recommend" and tmdb_ids:
+        # Gemini recommends movies — show poster cards
+        db = Database(settings.sqlite_path)
+        movies = await asyncio.to_thread(_lookup_movies_by_tmdb_ids, db, tmdb_ids, settings.justwatch_country)
+
+        if movies:
+            context.user_data["seen_ids"] = seen_ids + [m["tmdb_id"] for m in movies]
+            await _replace_loading(reply)
+            await send_first_card(update, context, movies)
+        else:
+            # tmdb_ids didn't resolve to DB movies — just send the reply
+            logger.warning("Gemini recommended tmdb_ids not found in DB: %s", tmdb_ids)
+            await _replace_loading(reply)
+        return
+
+    # action == "ask" or no tmdb_ids — just send the conversational reply
+    await _replace_loading(reply)
 
 
+# ---------------------------------------------------------------------------
+# Callback button handler — navigation, pick, shuffle, device
+# ---------------------------------------------------------------------------
 async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard button presses for recommendations."""
     if not await _guard_update(update, context, apply_rate_limit=False):
         return
     query = update.callback_query
@@ -1016,70 +950,69 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     action = data.get("action")
 
-    if action == "exit_chat":
-        # Exit chat mode — clear state
-        context.user_data["chat_mode"] = False
-        context.user_data.pop("chat_history", None)
-        chat_id = update.effective_chat.id
-        existing = _chat_concierges.get(chat_id)
-        if existing:
-            existing.reset()
-        await query.edit_message_text("Chat mode end. Rocky here when you return. Use mood buttons or just type.")
-        return
-
-    if action == "pick":
-        # User picked a movie — show device picker
+    if action == "nav":
         movies = context.user_data.get("current_recommendations", [])
-        idx = data.get("idx", 0)
-        if idx < 0 or idx >= len(movies):
-            await query.edit_message_text("Invalid selection.")
+        index = data.get("idx", 0)
+        await show_movie_card(query, context, movies, index)
+
+    elif action == "pick":
+        tmdb_id = data.get("tmdb_id")
+        movies = context.user_data.get("current_recommendations", [])
+        selected = None
+        for m in movies:
+            if m.get("tmdb_id") == tmdb_id:
+                selected = m
+                break
+        if not selected:
+            await query.edit_message_caption(caption="Invalid selection.")
             return
-        selected = movies[idx]
         await send_device_picker(update, context, selected)
 
     elif action == "shuffle":
-        # Re-run recommendation with same last intent, different results
-        last_intent = context.user_data.get("last_intent", "something good")
+        # Re-run recommendation using Gemini brain with same context
         settings: Settings = context.bot_data["settings"]
         chat_id = update.effective_chat.id
+        brain = _get_brain(chat_id, settings)
+        seen_ids = context.user_data.get("seen_ids", [])
+
+        await query.edit_message_caption(caption=get_rocky_response("shuffle"))
 
         try:
-            concierge = _get_concierge(chat_id, settings)
-            movies = await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 asyncio.to_thread(
-                    concierge.recommend,
-                    last_intent,
-                    context.user_data.get("seen_ids", []),
+                    brain.chat,
+                    "Show me different movies, not the ones you already recommended.",
+                    shown_ids=seen_ids,
                 ),
                 timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
             )
-            _concierge_last_used[chat_id] = time.time()
         except Exception as exc:
             logger.exception("Shuffle recommendation failed")
-            await query.edit_message_text(
-                _friendly_error_message(exc, "Couldn't find more. Please try again.")
-            )
+            await query.edit_message_caption(caption=_friendly_error_message(exc, "Couldn't find more. Please try again."))
             return
+
+        tmdb_ids = result.get("tmdb_ids", [])
+        if not tmdb_ids:
+            await query.edit_message_caption(caption="No more match. Try different words?")
+            return
+
+        db = Database(settings.sqlite_path)
+        movies = await asyncio.to_thread(_lookup_movies_by_tmdb_ids, db, tmdb_ids, settings.justwatch_country)
 
         if not movies:
-            await query.edit_message_text("No more match. Try different words?")
+            await query.edit_message_caption(caption="No more match. Try different words?")
             return
 
-        # Track shown movies
-        context.user_data["seen_ids"].extend([m["tmdb_id"] for m in movies])
-
-        # Send new recommendations
-        await query.edit_message_text("Rocky find other option:")
-        await send_recommendations(update, context, movies)
+        context.user_data["seen_ids"] = seen_ids + [m["tmdb_id"] for m in movies]
+        await show_movie_card(query, context, movies, 0)
 
     elif action == "device":
-        # User picked a device — try to play
         play_key = data.get("play_key")
         dev_idx = data.get("dev_idx", 0)
 
         session_data = _play_sessions.get(play_key)
         if not session_data:
-            await query.edit_message_text("Session expired. Try asking again.")
+            await query.edit_message_caption(caption="Session expired. Try asking again.")
             return
 
         chat_id_check = update.effective_chat.id if update.effective_chat else None
@@ -1089,147 +1022,152 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         devices = session_data["devices"]
         if dev_idx < 0 or dev_idx >= len(devices):
-            await query.edit_message_text("Invalid device.")
+            await query.edit_message_caption(caption="Invalid device.")
             _play_sessions.pop(play_key, None)
             return
 
         device = devices[dev_idx]
         movie = context.user_data.get("selected_movie", {})
         movie_name = movie.get("title", session_data.get("movie_name", "Unknown"))
-        settings: Settings = context.bot_data["settings"]
 
-        # Search Jellyfin for the movie to get the item_id
-        try:
-            client = JellyfinClient(
-                base_url=settings.jellyfin_url,
-                api_key=settings.jellyfin_api_key,
-                username=settings.jellyfin_username,
-            )
-            jellyfin_movies = await asyncio.wait_for(
-                asyncio.to_thread(client.search_movies, movie_name, 5),
-                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-            )
-            if jellyfin_movies:
-                item_id = jellyfin_movies[0].item_id
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.play, session_id=device["session_id"], item_id=item_id
-                    ),
-                    timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-                )
-                await query.edit_message_text(
-                    f"▶️ Playing *{movie_name}* on {device['label']}. Fist my bump.",
-                    parse_mode="Markdown",
-                )
-                logger.info("Playback triggered via bot: %s on %s", movie_name, device["label"])
-            else:
-                await query.edit_message_text(
-                    f"*{movie_name}* not in Jellyfin library. Rocky sad.",
-                    parse_mode="Markdown",
-                )
-        except Exception as exc:
-            logger.exception("Device playback failed")
-            await query.edit_message_text(
-                _friendly_error_message(exc, f"Cannot play on {device['label']}. Jellyfin app open?")
-            )
-        finally:
+        # Store pending play for undo window
+        context.user_data["pending_play"] = {
+            "movie": movie_name,
+            "device": device,
+            "play_key": play_key,
+            "expires": time.time() + 10,
+        }
+        context.user_data["rocky_state"] = STATE_PLAYING
+
+        # Show undo button with countdown
+        await query.edit_message_caption(
+            caption=f"▶️ Playing *{movie_name}* on {device['label']}...\n\n_Tap undo to cancel_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "↩ Undo — 10s",
+                    callback_data=json.dumps({"action": "undo"}),
+                ),
+            ]]),
+        )
+
+        # Launch background task for delayed playback
+        chat_id = update.effective_chat.id
+        message_id = query.message.message_id
+        asyncio.create_task(
+            _execute_delayed_playback(context, chat_id, message_id, movie_name, device, play_key)
+        )
+
+    elif action == "undo":
+        pending = context.user_data.pop("pending_play", None)
+        if not pending:
+            await query.answer("Nothing to undo.", show_alert=True)
+            return
+
+        # Cancel the pending play
+        play_key = pending.get("play_key")
+        if play_key:
             _play_sessions.pop(play_key, None)
+
+        movie_name = pending.get("movie", "Unknown")
+        logger.info("Playback undone: %s", movie_name)
+
+        # Return to movie card
+        movies = context.user_data.get("current_recommendations", [])
+        index = context.user_data.get("current_movie_index", 0)
+        if movies and 0 <= index < len(movies):
+            context.user_data["rocky_state"] = STATE_SHOWING_CARDS
+            await show_movie_card(query, context, movies, index)
+        else:
+            context.user_data["rocky_state"] = STATE_IDLE
+            await query.edit_message_caption(
+                caption=f"↩ Cancelled *{movie_name}*.",
+                parse_mode="Markdown",
+            )
 
     else:
         await query.edit_message_text("Unknown action.")
 
 
-async def callback_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle legacy play button presses (p|<key>|<idx> format)."""
+# ---------------------------------------------------------------------------
+# Reaction handler
+# ---------------------------------------------------------------------------
+async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard_update(update, context, apply_rate_limit=False):
         return
-    query = update.callback_query
-    await query.answer()
-
-    # Parse: p|<play_key>|<device_index>
-    parts = query.data.split("|")
-    if len(parts) != 3 or parts[0] != "p":
-        await query.edit_message_text("Invalid selection.")
-        return
-
-    _, play_key_str, dev_idx_str = parts
-    try:
-        play_key = int(play_key_str)
-        dev_idx = int(dev_idx_str)
-    except ValueError:
-        await query.edit_message_text("Invalid selection.")
-        return
-
-    session_data = _play_sessions.get(play_key)
-    if not session_data:
-        await query.edit_message_text("Session expired. Try asking again.")
-        return
-
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if session_data.get("chat_id") != chat_id:
-        await query.answer("This selection is not valid in this chat.", show_alert=True)
-        return
-
-    owner_user_id = session_data.get("user_id")
-    current_user_id = update.effective_user.id if update.effective_user else None
-    if owner_user_id is not None and current_user_id is not None and owner_user_id != current_user_id:
-        await query.answer("Only the original requester can use these buttons.", show_alert=True)
-        return
-
-    devices = session_data["devices"]
-    if dev_idx < 0 or dev_idx >= len(devices):
-        await query.edit_message_text("Invalid device.")
-        _play_sessions.pop(play_key, None)
-        return
-
-    device = devices[dev_idx]
-    movie_name = session_data["movie_name"]
-    item_id = session_data["item_id"]
     settings: Settings = context.bot_data["settings"]
-
-    try:
-        client = JellyfinClient(
-            base_url=settings.jellyfin_url,
-            api_key=settings.jellyfin_api_key,
-            username=settings.jellyfin_username,
-        )
-        await asyncio.wait_for(
-            asyncio.to_thread(client.play, session_id=device["session_id"], item_id=item_id),
-            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
-        )
-        await query.edit_message_text(f"▶ Playing {movie_name} on {device['label']}. Grace Rocky save movies.")
-        logger.info("Playback triggered via bot: %s on %s", movie_name, device["label"])
-    except Exception as exc:
-        logger.exception("Callback play failed")
-        await query.edit_message_text(
-            _friendly_error_message(exc, "Playback failed. Please try again.")
-        )
-    finally:
-        _play_sessions.pop(play_key, None)
-
-
-async def callback_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle skip button presses."""
-    if not await _guard_update(update, context, apply_rate_limit=False):
+    reaction_update = update.message_reaction
+    if not reaction_update:
         return
+    current_recs = context.user_data.get("current_recommendations", [])
+    for reaction in (reaction_update.new_reaction or []):
+        emoji = getattr(reaction, 'emoji', None)
+        if not emoji:
+            continue
+        reaction_value = REACTION_MAP.get(emoji)
+        if not reaction_value:
+            continue
+        if current_recs:
+            for movie in current_recs:
+                db = Database(settings.sqlite_path)
+                await asyncio.to_thread(
+                    db.log_watch_history,
+                    tmdb_id=movie.get("tmdb_id"),
+                    title=movie.get("title"),
+                    reaction=reaction_value,
+                    reaction_emoji=emoji,
+                )
+            logger.info("Logged reaction %s (%s) for %d movies", emoji, reaction_value, len(current_recs))
 
-    query = update.callback_query
-    await query.answer()
 
-    # Format: skip or skip|<play_key>
-    parts = (query.data or "").split("|")
-    if len(parts) == 2 and parts[1].isdigit():
-        _play_sessions.pop(int(parts[1]), None)
+# ---------------------------------------------------------------------------
+# /watched command
+# ---------------------------------------------------------------------------
+async def cmd_watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard_update(update, context):
+        return
+    settings: Settings = context.bot_data["settings"]
+    title = " ".join(context.args or []).strip() if context.args else ""
+    if not title:
+        await update.message.reply_text("Usage: /watched <movie title>\nExample: /watched Parasite")
+        return
+    db = Database(settings.sqlite_path)
+    with db._connect() as conn:
+        row = conn.execute(
+            "SELECT tmdb_id, title FROM movies WHERE LOWER(title) LIKE ? AND tmdb_id IS NOT NULL LIMIT 1",
+            (f"%{title.lower()}%",),
+        ).fetchone()
+    if row:
+        await asyncio.to_thread(db.log_watch_history, tmdb_id=row["tmdb_id"], title=row["title"], reaction="liked", reaction_emoji="👍")
+        await update.message.reply_text(f"Logged *{row['title']}* as watched 👍", parse_mode="Markdown")
+    else:
+        await asyncio.to_thread(db.log_watch_history, tmdb_id=None, title=title, reaction="liked", reaction_emoji="👍")
+        await update.message.reply_text(f"Logged *{title}* as watched (not in your library)", parse_mode="Markdown")
 
-    await query.edit_message_text("Okay. What else you want watch?")
+
+# ---------------------------------------------------------------------------
+# Bot menu & command registration
+# ---------------------------------------------------------------------------
+_ROCKY_COMMANDS = [
+    BotCommand("start", "Start Rocky — show welcome"),
+    BotCommand("devices", "List active Jellyfin devices"),
+    BotCommand("status", "Show watchlist sync status"),
+    BotCommand("stats", "Watchlist progress card"),
+    BotCommand("reset", "Reset conversation memory"),
+    BotCommand("watched", "Log a movie as watched"),
+]
+
+
+async def _register_bot_menu(application) -> None:
+    await application.bot.set_my_commands(_ROCKY_COMMANDS)
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    logger.info("Bot menu registered with %d commands", len(_ROCKY_COMMANDS))
 
 
 # ---------------------------------------------------------------------------
 # Bot runner
 # ---------------------------------------------------------------------------
-
 def run_bot() -> None:
-    """Start the Telegram bot (blocking)."""
     from rocky.logging_config import setup_logging
     setup_logging()
 
@@ -1239,34 +1177,36 @@ def run_bot() -> None:
         print("TELEGRAM_BOT_TOKEN is not set. Get one from @BotFather.")
         return
 
+    # Initialize DB schema once at startup instead of per-handler
+    _startup_db = Database(settings.sqlite_path)
+    _startup_db.init_schema()
+    logger.info("Database schema initialized at startup")
+
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     app.bot_data["settings"] = settings
+
+    app.post_init = _register_bot_menu
 
     # Conversational handler (all text messages)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Slash commands (power-user shortcuts)
+    # Slash commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("devices", cmd_devices))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("chat", cmd_chat))
 
-    # Reaction handler — uses MessageReactionHandler for message_reaction updates
+    # Reaction handler
     app.add_handler(MessageReactionHandler(_handle_reaction))
 
-    # /watched command fallback for manual watch logging
+    # /watched command
     app.add_handler(CommandHandler("watched", cmd_watched))
 
     # Recommendation inline button callback (JSON-based actions)
-    app.add_handler(CallbackQueryHandler(callback_button, pattern=r'^\{".*"'))
+    app.add_handler(CallbackQueryHandler(callback_button, pattern=r'^\{\".*\"'))
 
-    # Legacy play/skip button callbacks
-    app.add_handler(CallbackQueryHandler(callback_play, pattern=r"^p\|"))
-    app.add_handler(CallbackQueryHandler(callback_skip, pattern=r"^skip(?:\|\d+)?$"))
-
-    # Feature 2: Set up APScheduler for weekly stats card
+    # Weekly stats scheduler
     if settings.telegram_chat_id:
         try:
             from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -1280,7 +1220,6 @@ def run_bot() -> None:
                 timezone="Asia/Kolkata",
                 args=[app.bot, settings],
             )
-            # Weekly taste profile regeneration (same cadence as stats)
             scheduler.add_job(
                 lambda: generate_taste_profile(settings.sqlite_path),
                 trigger="cron",
