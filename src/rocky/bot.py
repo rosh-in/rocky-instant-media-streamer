@@ -15,6 +15,7 @@ from typing import Optional
 import requests
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MenuButtonCommands, ReplyKeyboardRemove, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
@@ -34,6 +35,7 @@ from rocky.rocky_dialogue import get_rocky_response
 from rocky.stats import generate_stats
 from rocky.taste_profile import generate_taste_profile
 from rocky.tmdb import TmdbClient
+from rocky.adb_controller import wake_and_launch as adb_wake_and_launch
 
 logger = logging.getLogger("rocky.bot")
 
@@ -50,7 +52,7 @@ _play_sessions: dict[int, dict] = {}
 _play_counter: int = 0
 _rate_limit_events: dict[int, deque[float]] = {}
 
-_BLOCKING_CALL_TIMEOUT_SECONDS = 45
+_BLOCKING_CALL_TIMEOUT_SECONDS = 90
 _FALLBACK_POSTER = "https://placehold.co/500x750/1a1a2e/eee?text=No+Poster"
 _PLAY_SESSION_TTL_SECONDS = 15 * 60
 _MAX_PLAY_SESSIONS = 500
@@ -479,12 +481,39 @@ async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id:
         _reset_rocky_state(context.user_data, full=True)
 
 
+async def _adb_pre_wake_phone(settings: Settings, chat_id: Optional[int] = None, bot = None) -> None:
+    """If ADB phone is configured, wake + launch Jellyfin before listing devices.
+
+    This ensures the phone's Jellyfin session registers so it appears in the device list.
+    """
+    if not settings.adb_phone_ip:
+        return
+    try:
+        if bot and chat_id:
+            await bot.send_message(chat_id, "Rocky prepare phone. Small wait...")
+        adb_ok = await adb_wake_and_launch(
+            settings.adb_phone_ip,
+            settings.adb_phone_package,
+            settings.adb_phone_activity,
+            wait=4,
+        )
+        if adb_ok:
+            logger.info("ADB pre-wake succeeded for %s", settings.adb_phone_ip)
+        else:
+            logger.warning("ADB pre-wake failed for %s", settings.adb_phone_ip)
+    except Exception as exc:
+        logger.warning("ADB pre-wake error: %s", exc)
+
+
 async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, movie: dict) -> None:
     """Show device selection buttons after user picks a movie."""
     context.user_data["selected_movie"] = movie
     context.user_data["rocky_state"] = STATE_DEVICE_PICKING
     settings: Settings = context.bot_data["settings"]
     query = update.callback_query
+
+    # Pre-wake phone via ADB so it registers as a Jellyfin device
+    await _adb_pre_wake_phone(settings)
 
     devices = []
     try:
@@ -501,17 +530,28 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception as exc:
         logger.warning("Failed to list devices for picker: %s", exc)
 
+    # Build back button (used in both no-devices and normal paths)
+    back_button_row = [
+        InlineKeyboardButton(
+            "← Back to movie",
+            callback_data=json.dumps({"action": "back_to_card"}),
+        ),
+    ]
+
     if not devices:
+        back_keyboard = InlineKeyboardMarkup([back_button_row])
         if movie.get("in_jellyfin"):
             await query.edit_message_caption(
                 caption=f"*{movie['title']}* is in your library but no devices are active. Open Jellyfin on a device first.",
                 parse_mode="Markdown",
+                reply_markup=back_keyboard,
             )
         else:
             platforms = movie.get("ott_platforms", "")
             await query.edit_message_caption(
                 caption=f"*{movie['title']}* isn't in Jellyfin.\nAvailable on: {platforms}",
                 parse_mode="Markdown",
+                reply_markup=back_keyboard,
             )
         return
 
@@ -544,6 +584,8 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
             callback_data=json.dumps({"action": "device", "play_key": play_key, "dev_idx": i}),
         ))
     button_rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    # Add back button as a separate row (reuse the same row defined above)
+    button_rows.append(back_button_row)
     keyboard = InlineKeyboardMarkup(button_rows)
     await query.edit_message_caption(
         caption=f"*{movie['title']}* — where you want watch?",
@@ -726,6 +768,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 poster = movie.get("poster_url") or _FALLBACK_POSTER
                 caption = _build_movie_caption(movie)
                 await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown")
+                # Pre-wake phone via ADB so it registers as a Jellyfin device
+                await _adb_pre_wake_phone(settings, chat_id, context.bot)
+
                 # Show device picker
                 try:
                     client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
@@ -850,6 +895,9 @@ async def _handle_with_brain(
     # Render the response based on action
     if action == "play" and tmdb_ids:
         # Gemini says the user wants to play a specific movie
+        # Pre-wake phone via ADB so it registers as a Jellyfin device
+        await _adb_pre_wake_phone(settings, chat_id, context.bot)
+
         # Parallelize: fetch movie + Jellyfin devices at the same time
         db = Database(settings.sqlite_path)
 
@@ -940,12 +988,21 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await _guard_update(update, context, apply_rate_limit=False):
         return
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        if "query is too old" in str(e).lower():
+            logger.info("Stale callback query ignored")
+            return
+        raise
 
     try:
         data = json.loads(query.data)
     except (json.JSONDecodeError, TypeError):
-        await query.edit_message_text("Invalid selection.")
+        try:
+            await query.edit_message_text("Invalid selection.")
+        except BadRequest:
+            pass
         return
 
     action = data.get("action")
@@ -966,6 +1023,12 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not selected:
             await query.edit_message_caption(caption="Invalid selection.")
             return
+        # Store state before leaving the card so Back can restore it
+        context.user_data["pre_picker_state"] = {
+            "movie": selected,
+            "index": context.user_data.get("current_movie_index", 0),
+            "total": len(movies),
+        }
         await send_device_picker(update, context, selected)
 
     elif action == "shuffle":
@@ -1005,6 +1068,24 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         context.user_data["seen_ids"] = seen_ids + [m["tmdb_id"] for m in movies]
         await show_movie_card(query, context, movies, 0)
+
+    elif action == "back_to_card":
+        pre_state = context.user_data.get("pre_picker_state")
+        movies = context.user_data.get("current_recommendations", [])
+
+        if not pre_state:
+            # Fallback — state lost, go to first card
+            if movies:
+                await show_movie_card(query, context, movies, 0)
+            else:
+                await query.edit_message_caption(
+                    caption="Rocky lose place. Say what you want watch — Rocky find again.",
+                )
+            return
+
+        index = pre_state["index"]
+        await show_movie_card(query, context, movies, index)
+        context.user_data.pop("pre_picker_state", None)
 
     elif action == "device":
         play_key = data.get("play_key")
@@ -1050,6 +1131,9 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 ),
             ]]),
         )
+
+        # Clear picker state after successful play
+        context.user_data.pop("pre_picker_state", None)
 
         # Launch background task for delayed playback
         chat_id = update.effective_chat.id
