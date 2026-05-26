@@ -57,6 +57,8 @@ Primary user: me (single-user setup on home network).
 - Fuzzy title search across all title fields (title, tmdb_title, tmdb_original_title).
 - FastAPI webhook server for Jellyfin playback events and Radarr notifications.
 - Reaction-based watch history logging.
+- ChromaDB vector store for semantic search over movie catalog.
+- Taste profile generation from watch_history for personalized recommendations.
 - Operational docs and troubleshooting notes.
 
 ### Future Scope
