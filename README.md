@@ -13,7 +13,15 @@ I suffer from severe decision fatigue trying to choose an OTT movie to watch. I'
 Rocky is a bot I made to solve that. I went from wasting 20 mins jumping across OTTs TO finding and playing a movie in under 2 minutes, just by asking Rocky what I feel like and tapping play.
 
 ---
+## ROCKY DEMO
 
+https://github.com/user-attachments/assets/ef0414a8-c541-46d3-be20-fa786dd1cf5f
+
+https://github.com/user-attachments/assets/8dc42205-fc8e-4609-aa6f-4df58ca8fb82
+
+https://github.com/user-attachments/assets/d040f092-ce2e-486b-bd9e-6843cfc52b02
+
+---
 ## THIS IS HOW ROCKY DOES IT
 
 Under the hood, Rocky reads my Letterboxd watchlist → downloads it, finds subtitles, and makes it ready to play on any device on my home network (TV, phone, or laptop).
