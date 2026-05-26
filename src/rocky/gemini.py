@@ -24,6 +24,7 @@ from google.genai import types as genai_types
 
 from rocky.db import Database
 from rocky.taste_profile import load_taste_profile
+from rocky.vector_store import VectorStore
 
 logger = logging.getLogger("rocky.gemini")
 
@@ -38,7 +39,7 @@ _GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # Conversation history limits
 _MAX_HISTORY_EXCHANGES = 10  # keep last 10 user/assistant pairs
-_MAX_TOOL_ROUNDS = 5  # max function-call roundtrips per chat() call
+_MAX_TOOL_ROUNDS = 3  # max function-call roundtrips per chat() call
 
 
 # ---------------------------------------------------------------------------
@@ -273,22 +274,33 @@ movies from their personal watchlist.
 Taste profile: {taste_profile}
 Previously shown tmdb_ids (do NOT re-recommend these): {shown_ids}
 
-You have tools to search the movie database. ALWAYS use them before \
-recommending — never recommend blindly. Call the right tool based on \
-what the user asks for, then pick 1-3 movies from the results.
-
 Respond ONLY with valid JSON:
-{{"reply": "your conversational text in Rocky voice", "action": "ask|recommend|play", "tmdb_ids": [int]}}
+{{"reply": "your conversational text in Rocky voice", "action": "chat|ask|recommend|play", "tmdb_ids": [int]}}
 
-Rules:
-- "ask": you need one more clue from the user. ONLY use if the request is \
-extremely vague (like just "hi"). Default to recommending.
-- "recommend": you have 1-3 movies from search results. tmdb_ids must \
-match results exactly. Reply is a brief, enthusiastic pitch.
+Actions:
+- "chat": the user is just chatting, greeting you, or saying something \
+non-movie-related. Reply conversationally. No tmdb_ids. NO tool calls needed.
+- "ask": the user might want a movie but their request is too vague to pick \
+one. Ask one short clarifying question. No tmdb_ids. NO tool calls needed.
+- "recommend": the user wants a movie suggestion. You MUST call a tool first \
+to search the DB, then pick 1-3 movies from the results. tmdb_ids must match \
+results exactly. Reply is a brief, enthusiastic pitch.
 - "play": user clearly wants to watch a specific movie right now. 1 tmdb_id. \
 Reply confirms what's about to play.
-- If user seems confused ("huh?", "what?", "um"), just recommend something \
-from their taste profile.
+
+When to call tools:
+- ONLY call tools when the action is "recommend" or "play" and you need to \
+find movies. NEVER call tools for "chat" or "ask" actions.
+- Call ONE tool per round. Trust the results — do NOT re-call the same tool \
+with the same or similar args.
+- Pre-fetched semantic results may appear in the user message. Use them \
+if they fit. Only call a tool if pre-fetched results don't match what the \
+user wants.
+
+Rules:
+- Default to "chat" for greetings ("hey", "hi", "yo"), small talk, and \
+non-movie messages. Only switch to "recommend" when the user explicitly \
+asks for a movie or uses movie-related words (genre, mood, director, etc.).
 - Never recommend movies in the shown_ids list.
 - Prefer movies with jellyfin=1 (already in their library, ready to play).
 - Keep replies under 2 sentences. Be punchy, warm, a bit goofy.
@@ -320,6 +332,19 @@ class RockyBrain:
         # Vertex AI express mode — the Agent Platform API key routes
         # through Vertex AI endpoints, with higher rate limits than AI Studio.
         self._client = genai.Client(vertexai=True, api_key=gemini_api_key)
+
+        # Vector store for semantic search (fast path, no tool-call round trip)
+        self._vector_store = VectorStore(
+            gemini_api_key=gemini_api_key,
+            db_path=db_path,
+        )
+        # Sync on startup — skips already-embedded movies, fast after first run
+        movie_count = self._vector_store.count()
+        if movie_count == 0:
+            logger.info("ChromaDB empty — running first-time sync, this may take a minute...")
+        else:
+            logger.info("ChromaDB has %d movies, syncing new ones...", movie_count)
+        self._vector_store.sync()
 
         # Per-chat conversation history: list of Content objects
         self._history: list[genai_types.Content] = []
@@ -370,18 +395,56 @@ class RockyBrain:
                        (passed from bot.py to avoid re-recommending).
 
         Returns:
-            dict with keys: "reply" (str), "action" ("ask"/"recommend"/"play"),
+            dict with keys: "reply" (str), "action" ("chat"/"ask"/"recommend"/"play"),
             "tmdb_ids" (list[int])
         """
         # Update shown IDs
         if shown_ids:
             self._shown_ids = list(set(self._shown_ids + shown_ids))
 
-        # Add user message to history
+        # --- Semantic pre-fetch ---
+        # Search semantically before calling Gemini. If we get good results,
+        # inject them into the user message so Gemini can pick directly
+        # without needing a tool-call round trip.
+        # Skip for short non-movie messages (greetings, small talk) to avoid
+        # biasing Gemini toward recommending when it should just chat.
+        _short_casual = len(user_message.split()) <= 3 and not any(
+            kw in user_message.lower()
+            for kw in ("movie", "film", "watch", "recommend", "suggest", "pick",
+                       "genre", "mood", "comedy", "horror", "action", "drama",
+                       "thriller", "sci-fi", "romance", "animation", "director",
+                       "funny", "scary", "sad", "light", "heavy", "epic",
+                       "bored", "tonight", "weekend")
+        )
+        semantic_results = []
+        if not _short_casual:
+            try:
+                semantic_results = self._vector_store.semantic_search(
+                    query=user_message,
+                    country_code=self.country_code,
+                    limit=10,
+                    exclude_ids=self._shown_ids,
+                )
+            except Exception:
+                logger.warning("Semantic search failed, falling back to Gemini tools only", exc_info=True)
+
+        if semantic_results:
+            formatted = _format_movie_results(semantic_results)
+            augmented_message = (
+                f"{user_message}\n\n"
+                f"[Semantically relevant movies pre-fetched for this query:\n"
+                f"{formatted}\n"
+                f"Use these if they fit. Call tools if you need something different.]"
+            )
+        else:
+            augmented_message = user_message
+        # --- END semantic pre-fetch ---
+
+        # Add augmented message to history
         self._history.append(
             genai_types.Content(
                 role="user",
-                parts=[genai_types.Part.from_text(text=user_message)],
+                parts=[genai_types.Part.from_text(text=augmented_message)],
             )
         )
 
@@ -390,6 +453,9 @@ class RockyBrain:
             self._history = self._history[-(_MAX_HISTORY_EXCHANGES * 2):]
 
         system_prompt = self._build_system_prompt()
+
+        # Track tool calls already executed in this chat() invocation to avoid duplicates
+        _executed_tools: set[tuple[str, str]] = set()
 
         # Run the Gemini conversation with tool-call roundtrips
         for _round in range(_MAX_TOOL_ROUNDS + 1):
@@ -428,12 +494,22 @@ class RockyBrain:
                 # Process all function calls from this response
                 for part in fc_parts:
                     fc = part.function_call
-                    logger.info("Gemini tool call: %s(%s)", fc.name, dict(fc.args))
+                    args_dict = dict(fc.args)
+                    args_key = json.dumps(args_dict, sort_keys=True)
+                    call_sig = (fc.name, args_key)
+
+                    # Deduplicate: skip if we already executed this exact tool+args
+                    if call_sig in _executed_tools:
+                        logger.warning("Skipping duplicate tool call: %s(%s)", fc.name, args_dict)
+                        # Still append to history so Gemini sees the prior response
+                        continue
+                    _executed_tools.add(call_sig)
+                    logger.info("Gemini tool call: %s(%s)", fc.name, args_dict)
 
                     # Execute the tool locally
                     tool_result = _execute_tool(
                         name=fc.name,
-                        args=dict(fc.args),
+                        args=args_dict,
                         db=self.db,
                         country_code=self.country_code,
                         exclude_ids=self._shown_ids,
@@ -546,21 +622,25 @@ class RockyBrain:
         try:
             parsed = json.loads(raw)
             reply = parsed.get("reply", "Rocky thinking...")
-            action = parsed.get("action", "recommend")
+            action = parsed.get("action", "chat")
             tmdb_ids = parsed.get("tmdb_ids", [])
 
             # Validate action
-            if action not in ("ask", "recommend", "play"):
-                action = "recommend"
+            if action not in ("chat", "ask", "recommend", "play"):
+                action = "chat"
 
             # Validate tmdb_ids
             if not isinstance(tmdb_ids, list):
                 tmdb_ids = []
             tmdb_ids = [int(i) for i in tmdb_ids if isinstance(i, (int, float))]
 
+            # chat/ask should not carry tmdb_ids
+            if action in ("chat", "ask"):
+                tmdb_ids = []
+
             # Validate: recommend/play must have tmdb_ids
             if action in ("recommend", "play") and not tmdb_ids:
-                action = "ask"  # downgrade to asking
+                action = "chat"  # downgrade to casual reply
 
             return {
                 "reply": reply,
