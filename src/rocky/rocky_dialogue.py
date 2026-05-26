@@ -17,7 +17,8 @@ ROCKY_PLAY_AMBIGUOUS = [
 ]
 
 ROCKY_PLAY_DIRECT = [
-    "{title}. Where watch?",
+    "Amaze amaze amaze! {title}. Where watch?",
+    "{title}. Rocky find. Where watch?",
     "Rocky play {title}. Pick device.",
 ]
 
@@ -34,6 +35,15 @@ ROCKY_RESET = [
 ROCKY_SHUFFLE = [
     "Rocky shuffle. Different three coming.",
     "New picks. Rocky try again.",
+]
+
+ROCKY_GREETING = [
+    "Hey! What you want watch?",
+    "Yo! Rocky here. What movie you in mood for?",
+    "Rocky hear you! What you want watch tonight?",
+    "Hey hey! Tell Rocky what kind of movie you want.",
+    "Hello! Rocky ready. What you feel like watching?",
+    "Yo yo! Rocky standing by. What you want see?",
 ]
 
 
@@ -53,6 +63,7 @@ def get_rocky_response(category: str, **kwargs) -> str:
         "no_devices": ROCKY_NO_DEVICES,
         "reset": ROCKY_RESET,
         "shuffle": ROCKY_SHUFFLE,
+        "greeting": ROCKY_GREETING,
     }
     options = category_map.get(category, ROCKY_SHUFFLE)
     template = random.choice(options)
