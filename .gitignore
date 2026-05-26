@@ -21,6 +21,7 @@ mediaserver/data/
 *.sqlite3
 *.log
 data/logs/
+data/chroma/
 
 # Python
 __pycache__/
