@@ -31,7 +31,7 @@ from rocky.db import Database
 from rocky.gemini import RockyBrain
 from rocky.intent import is_direct_play, extract_play_title, is_casual_message
 from rocky.jellyfin import JellyfinClient
-from rocky.rocky_dialogue import get_rocky_response
+from rocky.rocky_dialogue import ROCKY_AMAZE, get_rocky_response
 from rocky.stats import generate_stats
 from rocky.taste_profile import generate_taste_profile
 from rocky.tmdb import TmdbClient
@@ -822,6 +822,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
             elif len(matches) > 1:
                 # Multiple matches — show cards
+                await update.message.reply_text(ROCKY_AMAZE)
                 await update.message.reply_text(get_rocky_response("play_ambiguous"))
                 await send_first_card(update, context, matches[:3])
             else:
@@ -895,6 +896,7 @@ async def _handle_with_brain(
     # Render the response based on action
     if action == "play" and tmdb_ids:
         # Gemini says the user wants to play a specific movie
+        await _replace_loading(ROCKY_AMAZE)
         # Pre-wake phone via ADB so it registers as a Jellyfin device
         await _adb_pre_wake_phone(settings, chat_id, context.bot)
 
@@ -964,12 +966,13 @@ async def _handle_with_brain(
 
     if action == "recommend" and tmdb_ids:
         # Gemini recommends movies — show poster cards
+        await _replace_loading(ROCKY_AMAZE)
+        await update.message.reply_text(reply)
         db = Database(settings.sqlite_path)
         movies = await asyncio.to_thread(_lookup_movies_by_tmdb_ids, db, tmdb_ids, settings.justwatch_country)
 
         if movies:
             context.user_data["seen_ids"] = seen_ids + [m["tmdb_id"] for m in movies]
-            await _replace_loading(reply)
             await send_first_card(update, context, movies)
         else:
             # tmdb_ids didn't resolve to DB movies — just send the reply

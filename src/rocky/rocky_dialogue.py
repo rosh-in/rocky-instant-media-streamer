@@ -46,6 +46,8 @@ ROCKY_GREETING = [
     "Yo yo! Rocky standing by. What you want see?",
 ]
 
+ROCKY_AMAZE = "Amaze Amaze Amaze"
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
