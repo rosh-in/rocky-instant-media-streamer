@@ -1088,6 +1088,68 @@ class Database:
             results.append(self._movie_row_to_dict(row, country_code))
         return results
 
+    def get_all_movies(self) -> list[dict]:
+        """Return all movies from the catalog for ChromaDB sync.
+
+        Only needs semantic fields — not OTT/jellyfin (ChromaDB doesn't use those).
+        """
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT tmdb_id, title, year, genre, director,
+                       mood_tags, tmdb_overview, runtime, origin_country,
+                       has_file
+                FROM movies
+                WHERE tmdb_id IS NOT NULL
+            """).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_movies_by_ids(self, tmdb_ids: list[int], country_code: str = "IN") -> list[dict]:
+        """Fetch full movie records by tmdb_id list, with OTT filtering.
+
+        Returns movies in arbitrary order — caller re-sorts by relevance.
+        """
+        if not tmdb_ids:
+            return []
+        placeholders = ",".join("?" * len(tmdb_ids))
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.genre, m.runtime,
+                       m.tmdb_overview, m.has_file, m.director, m.mood_tags,
+                       m.poster_url, m.trailer_key, m.vote_average
+                FROM movies m
+                WHERE m.tmdb_id IN ({placeholders})
+            """, tmdb_ids).fetchall()
+
+            results: list[dict] = []
+            for row in rows:
+                in_jellyfin = bool(row["has_file"])
+                ott_rows = conn.execute(
+                    """
+                    SELECT DISTINCT provider_name
+                    FROM availability
+                    WHERE movie_id = ? AND country_code = ?
+                    """,
+                    (row["id"], country_code.upper()),
+                ).fetchall()
+                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "tmdb_id": row["tmdb_id"],
+                    "genre": row["genre"],
+                    "runtime": row["runtime"],
+                    "overview": row["tmdb_overview"],
+                    "in_jellyfin": in_jellyfin,
+                    "ott_platforms": ott_platforms,
+                    "director": row["director"],
+                    "mood_tags": row["mood_tags"],
+                    "poster_url": row["poster_url"],
+                    "trailer_key": row["trailer_key"],
+                    "vote_average": row["vote_average"],
+                })
+            return results
+
     def get_all_directors(self) -> list[str]:
         """Return all unique non-null director names. Used for intent classification."""
         with self._connect() as conn:
