@@ -29,7 +29,7 @@ from telegram.ext import (
 from rocky.config import Settings, load_settings
 from rocky.db import Database
 from rocky.gemini import RockyBrain
-from rocky.intent import is_direct_play, extract_play_title
+from rocky.intent import is_direct_play, extract_play_title, is_casual_message
 from rocky.jellyfin import JellyfinClient
 from rocky.rocky_dialogue import get_rocky_response
 from rocky.stats import generate_stats
@@ -749,6 +749,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     async with lock:
         # ------------------------------------------------------------------
+        # Fast path: CASUAL_MESSAGE — "hey", "hi", "yo" → respond locally
+        # ------------------------------------------------------------------
+        if is_casual_message(user_text) and state not in (STATE_DEVICE_PICKING, STATE_PLAYING):
+            await update.message.reply_text(get_rocky_response("greeting"))
+            return
+
+        # ------------------------------------------------------------------
         # Fast path: DIRECT_PLAY — "play X", "watch X" → skip Gemini
         # ------------------------------------------------------------------
         if is_direct_play(user_text) and state not in (STATE_DEVICE_PICKING, STATE_PLAYING):
@@ -878,19 +885,12 @@ async def _handle_with_brain(
     action = result.get("action", "ask")
     tmdb_ids = result.get("tmdb_ids", [])
 
-    # Helper to replace the loading indicator with text
+    # Helper to replace the loading indicator with the reply
     async def _replace_loading(text: str, **kwargs) -> None:
         try:
             await loading_msg.edit_text(text, **kwargs)
         except Exception:
             await update.message.reply_text(text, **kwargs)
-
-    # Helper to delete the loading indicator (before sending photos/cards)
-    async def _delete_loading() -> None:
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
 
     # Render the response based on action
     if action == "play" and tmdb_ids:
@@ -977,7 +977,7 @@ async def _handle_with_brain(
             await _replace_loading(reply)
         return
 
-    # action == "ask" or no tmdb_ids — just send the conversational reply
+    # action == "chat" or "ask" or no tmdb_ids — just send the conversational reply
     await _replace_loading(reply)
 
 
