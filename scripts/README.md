@@ -46,7 +46,21 @@ Conversational movie concierge powered by Gemini 2.5 Flash Lite.
 PYTHONPATH=src python -m rocky.bot
 ```
 
-Slash commands: `/start`, `/reset`, `/devices`, `/status`. All text messages are routed to the Gemini concierge with per-chat memory and inline device selection buttons.
+Slash commands: `/start`, `/reset`, `/devices`, `/status`, `/stats`, `/watched <title>`. All text messages are routed through intent classification — direct-play requests skip Gemini, everything else goes to the Rocky brain with per-chat memory, tool declarations, and inline device selection buttons.
+
+## `run_webhook.py`
+Starts the FastAPI webhook server that receives Jellyfin playback events and Radarr notifications. Logs playback completions to `watch_history` and Radarr grab/import events for reference.
+
+```sh
+python scripts/run_webhook.py
+```
+
+Endpoints:
+- `POST /webhook/jellyfin/playback` — Jellyfin playback completion events
+- `POST /webhook/radarr` — Radarr grab/import notifications
+- `GET /health` — Health check
+
+Runs on port 8400 by default.
 
 ## Scheduled Sync (macOS launchd)
 

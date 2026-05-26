@@ -44,7 +44,7 @@ The full pipeline runs as a single scheduled job (daily via macOS launchd) and r
 A media library for a household doesn't need a server process. SQLite is zero-config, runs embedded, and handles the read-heavy query pattern perfectly. The trade-off: no built-in concurrency — but only one sync job runs at a time, so it's the right constraint for the problem.
 
 ### Gemini Flash Lite over larger models
-The concierge runs on Gemini 2.5 Flash Lite (free tier: 15 RPM). I built a proactive RPM tracker and retry system with exponential backoff so the bot stays within quota without users ever seeing a delay. The trade-off: less nuanced reasoning than larger models — but for "pick a movie from this list," speed and cost win over depth.
+The brain runs on Gemini 2.5 Flash Lite (free tier: 15 RPM) with tool declarations for search functions (keywords, mood, director, genre, short movies, world cinema). Multi-round function calling lets Gemini query the local database before recommending — it must search before it suggests. I built a proactive RPM tracker and retry system with exponential backoff so the bot stays within quota without users ever seeing a delay. The trade-off: less nuanced reasoning than larger models — but for "pick a movie from this list," speed and cost win over depth.
 
 ### Telegram bot over a custom web UI
 Building a conversational interface via Telegram gave me a fully hosted, cross-platform UI with push notifications, inline buttons, and auth — for free. The trade-off: less layout control — but the goal was reducing friction to zero, and everyone already has Telegram open.
@@ -83,8 +83,9 @@ I treated this like a product launch: each phase had a clear scope, success crit
 - **Phase 4 — Subtitles**: Bazarr + FlareSolverr. Small addition, outsized impact on non-English households.
 - **Phase 5 — Playback control**: Jellyfin API client with multi-device support. For the first time, you could trigger playback without leaving the couch.
 - **Phase 6 — Conversational interface**: Telegram bot + Gemini concierge with tool use, inline device picker, taste profiles, and rate limiting. The "aha" moment — the system went from automated to intelligent.
+- **Phase 7 — Brain architecture**: Refactored bot to intent-routing architecture (direct-play fast-path skips Gemini). Added Rocky personality, ADB phone wake, back navigation, and multi-round Gemini function calling with local tool execution.
 
-Each phase was incremental and backward-compatible. No rewrites, no breaking changes. The roadmap is documented in [ROADMAP.md](ROADMAP.md) and the product spec in [PRD.md](PRD.md).
+Each phase was incremental and backward-compatible. No rewrites, no breaking changes. The product spec is in [PRD.md](PRD.md).
 
 ## Future Product Vision
 
@@ -290,8 +291,18 @@ Available slash commands:
 - `/reset` — Clear conversation memory
 - `/devices` — List active Jellyfin devices
 - `/status` — Show last sync run and library stats
+- `/stats` — Watchlist progress card
+- `/watched <title>` — Log a movie as watched
 
-The bot supports inline device selection — when you ask to play a movie without specifying a device, it shows a button picker. It also enforces per-user rate limiting and optional access allowlists.
+**Intent routing**: "Play X" and "Watch X" messages skip Gemini and go straight to the device picker (fast-path via local intent classifier). Everything else routes to the Gemini brain.
+
+**ADB phone wake**: If `ADB_PHONE_IP` is configured, Rocky automatically wakes the phone screen, unlocks it, and launches the Jellyfin app before showing the device picker.
+
+**Back navigation**: A back button on the device picker lets you return to the movie card without re-searching.
+
+**Reaction logging**: React to a recommendation with ❤️🔥👍😐👎🤮 to log it in your watch history.
+
+The bot supports inline device selection, per-user rate limiting, optional access allowlists, and a weekly stats summary (Fridays at 18:00 if `TELEGRAM_CHAT_ID` is set).
 
 Requires `TELEGRAM_BOT_TOKEN` (from @BotFather) and `GEMINI_API_KEY` in `.env`.
 The current shared settings loader also requires `LETTERBOXD_USERNAME` and `TMDB_API_KEY` to be present when launching the bot.
@@ -336,6 +347,12 @@ All configuration is done through environment variables (`.env` file):
 - `TELEGRAM_ALLOWED_CHAT_IDS` — Optional comma-separated chat IDs allowed to use the bot (default: empty = allow all).
 - `TELEGRAM_RATE_LIMIT_WINDOW_SECONDS` — Sliding rate-limit window in seconds (default: `20`; set `0` to disable).
 - `TELEGRAM_RATE_LIMIT_MAX_MESSAGES` — Max messages allowed per window (default: `8`; set `0` to disable).
+- `TELEGRAM_CHAT_ID` — Optional chat ID for scheduled weekly stats.
+
+**ADB (Android Debug Bridge)**
+- `ADB_PHONE_IP` — Phone IP address for wireless ADB (optional; enables phone wake + Jellyfin launch).
+- `ADB_PHONE_PACKAGE` — Android package name to launch (default: `org.jellyfin.mobile`).
+- `ADB_PHONE_ACTIVITY` — Activity name to launch (default: `org.jellyfin.mobile.MainActivity`).
 
 ## Logging
 
@@ -349,8 +366,6 @@ All external API calls (TMDB, JustWatch, Letterboxd, Radarr) include automatic r
 Rocky/
 ├── .env.example              # env var template
 ├── PRD.md                    # product requirements
-├── ROADMAP.md                # phased execution tracker
-├── requirements.txt          # python dependencies
 ├── data/
 │   ├── rocky.db       # sqlite database (gitignored)
 │   └── logs/                 # application logs (gitignored)
@@ -370,15 +385,18 @@ Rocky/
 └── src/rocky/
     ├── __init__.py           # package marker
     ├── config.py             # settings loader (.env → dataclass)
-    ├── db.py                 # sqlite schema, sync runs, movie CRUD, mood tags
+    ├── db.py                 # sqlite schema, sync runs, movie CRUD, fuzzy title search
     ├── letterboxd.py         # watchlist scraper
     ├── tmdb.py               # TMDB metadata enrichment
     ├── justwatch.py          # OTT availability via JustWatch GraphQL
     ├── radarr.py             # Radarr API client
     ├── sync.py               # pipeline orchestration
     ├── jellyfin.py           # Jellyfin playback client (play, pause, stop)
-    ├── gemini.py             # Gemini 2.5 Flash Lite concierge with tool use + RPM management
-    ├── bot.py                # Telegram bot (polling, inline buttons, rate limiting)
+    ├── gemini.py             # Gemini 2.5 Flash Lite brain with tool declarations + multi-round function calling
+    ├── intent.py             # local intent classifier for direct-play fast-path
+    ├── rocky_dialogue.py     # Rocky personality responses for UI paths
+    ├── adb_controller.py     # ADB controller — wake screen, unlock, launch Jellyfin on Android
+    ├── bot.py                # Telegram bot (intent routing, inline buttons, ADB pre-wake, back navigation)
     ├── stats.py              # watchlist progress card generator
     ├── taste_profile.py      # per-user taste profile from watch history
     ├── webhook.py            # FastAPI webhook server (Jellyfin + Radarr events)
