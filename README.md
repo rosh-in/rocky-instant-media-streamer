@@ -83,7 +83,8 @@ I treated this like a product launch: each phase had a clear scope, success crit
 - **Phase 4 — Subtitles**: Bazarr + FlareSolverr. Small addition, outsized impact on non-English households.
 - **Phase 5 — Playback control**: Jellyfin API client with multi-device support. For the first time, you could trigger playback without leaving the couch.
 - **Phase 6 — Conversational interface**: Telegram bot + Gemini concierge with tool use, inline device picker, taste profiles, and rate limiting. The "aha" moment — the system went from automated to intelligent.
-- **Phase 7 — Brain architecture**: Refactored bot to intent-routing architecture (direct-play fast-path skips Gemini). Added Rocky personality, ADB phone wake, back navigation, and multi-round Gemini function calling with local tool execution.
+- **Phase 7 — Brain architecture**: Refactored bot to intent-routing architecture (direct-play fast-path skips Gemini). Added Rocky personality, ADB phone wake, back navigation, multi-round Gemini function calling with local tool execution, and ChromaDB semantic search.
+- **Phase 8 — Polish & Delivery**: Code cleanup, webhook server for event ingestion (Jellyfin + Radarr), taste profile generation, and preparation for public release. Project is now in maintenance mode.
 
 Each phase was incremental and backward-compatible. No rewrites, no breaking changes. The product spec is in [PRD.md](PRD.md).
 
@@ -363,7 +364,7 @@ All external API calls (TMDB, JustWatch, Letterboxd, Radarr) include automatic r
 ## Project Structure
 
 ```
-Rocky/
+project toto/
 ├── .env.example              # env var template
 ├── PRD.md                    # product requirements
 ├── data/
@@ -393,13 +394,14 @@ Rocky/
     ├── sync.py               # pipeline orchestration
     ├── jellyfin.py           # Jellyfin playback client (play, pause, stop)
     ├── gemini.py             # Gemini 2.5 Flash Lite brain with tool declarations + multi-round function calling
-    ├── intent.py             # local intent classifier for direct-play fast-path
-    ├── rocky_dialogue.py     # Rocky personality responses for UI paths
+    ├── intent.py             # local intent classifier for direct-play fast-path + casual message detection
+    ├── rocky_dialogue.py     # Rocky personality responses for UI paths (slash commands, errors)
     ├── adb_controller.py     # ADB controller — wake screen, unlock, launch Jellyfin on Android
-    ├── bot.py                # Telegram bot (intent routing, inline buttons, ADB pre-wake, back navigation)
-    ├── stats.py              # watchlist progress card generator
-    ├── taste_profile.py      # per-user taste profile from watch history
-    ├── webhook.py            # FastAPI webhook server (Jellyfin + Radarr events)
+    ├── bot.py                # Telegram bot (intent routing, inline buttons, ADB pre-wake, back navigation, reaction logging)
+    ├── stats.py              # watchlist progress card generator (/stats command)
+    ├── taste_profile.py      # per-user taste profile from watch history (for Gemini context)
+    ├── webhook.py            # FastAPI webhook server (Jellyfin playback events + Radarr notifications)
+    ├── vector_store.py       # ChromaDB semantic search layer for movie discovery
     └── logging_config.py     # structured logging setup
 ```
 
