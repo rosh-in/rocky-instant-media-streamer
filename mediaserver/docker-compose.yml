@@ -131,7 +131,7 @@ services:
       - TZ=${TZ}
     volumes:
       - ./config/bazarr:/config
-      - ./data/media/movies:/movies
+      - ./data/media/movies:/data/media/movies
     ports:
       - "${BAZARR_PORT}:6767"
     restart: unless-stopped
