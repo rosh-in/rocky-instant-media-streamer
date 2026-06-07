@@ -37,6 +37,7 @@ class Settings:
     telegram_rate_limit_max_messages: int
     telegram_chat_id: Optional[int]
     adb_phone_ip: Optional[str]
+    adb_phone_port: int
     adb_phone_package: str
     adb_phone_activity: str
 
@@ -147,6 +148,11 @@ def load_settings() -> Settings:
     telegram_chat_id = int(telegram_chat_id_raw) if telegram_chat_id_raw else None
 
     adb_phone_ip = os.getenv("ADB_PHONE_IP", "").strip() or None
+    adb_phone_port_raw = os.getenv("ADB_PHONE_PORT", "5555").strip()
+    try:
+        adb_phone_port = int(adb_phone_port_raw)
+    except ValueError as exc:
+        raise ValueError("ADB_PHONE_PORT must be an integer.") from exc
     adb_phone_package = os.getenv("ADB_PHONE_PACKAGE", "org.jellyfin.mobile").strip()
     adb_phone_activity = os.getenv("ADB_PHONE_ACTIVITY", "org.jellyfin.mobile.MainActivity").strip()
 
@@ -195,6 +201,7 @@ def load_settings() -> Settings:
         telegram_rate_limit_max_messages=telegram_rate_limit_max_messages,
         telegram_chat_id=telegram_chat_id,
         adb_phone_ip=adb_phone_ip,
+        adb_phone_port=adb_phone_port,
         adb_phone_package=adb_phone_package,
         adb_phone_activity=adb_phone_activity,
     )
