@@ -10,12 +10,12 @@ from typing import Optional
 logger = logging.getLogger("rocky.adb")
 
 
-async def ensure_connected(phone_ip: str, timeout: int = 10) -> bool:
+async def ensure_connected(phone_ip: str, port: int = 5555, timeout: int = 10) -> bool:
     """Make sure ADB is connected to the phone over WiFi.
 
     If not already connected, attempt to connect. Returns True on success.
     """
-    target = f"{phone_ip}:5555"
+    target = f"{phone_ip}:{port}"
 
     # Check if already connected
     try:
@@ -53,6 +53,7 @@ async def wake_and_launch(
     package: str,
     activity: str,
     *,
+    port: int = 5555,
     wait: float = 4.0,
     timeout: int = 10,
 ) -> bool:
@@ -60,10 +61,10 @@ async def wake_and_launch(
 
     Returns True if all steps succeeded, False otherwise.
     """
-    target = f"{phone_ip}:5555"
+    target = f"{phone_ip}:{port}"
 
     # Step 1 — Ensure connected
-    if not await ensure_connected(phone_ip, timeout=timeout):
+    if not await ensure_connected(phone_ip, port=port, timeout=timeout):
         logger.error("Cannot connect to phone at %s — is wireless debugging on?", phone_ip)
         return False
 
@@ -112,6 +113,6 @@ async def wake_and_launch(
     return True
 
 
-async def is_phone_reachable(phone_ip: str, timeout: int = 5) -> bool:
+async def is_phone_reachable(phone_ip: str, port: int = 5555, timeout: int = 5) -> bool:
     """Quick check if the phone is reachable via ADB (without launching anything)."""
-    return await ensure_connected(phone_ip, timeout=timeout)
+    return await ensure_connected(phone_ip, port=port, timeout=timeout)
