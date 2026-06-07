@@ -35,7 +35,7 @@ from rocky.rocky_dialogue import ROCKY_AMAZE, get_rocky_response
 from rocky.stats import generate_stats
 from rocky.taste_profile import generate_taste_profile
 from rocky.tmdb import TmdbClient
-from rocky.adb_controller import wake_and_launch as adb_wake_and_launch
+from rocky.adb_controller import wake_and_launch as adb_wake_and_launch, ensure_connected as adb_ensure_connected, is_phone_reachable as adb_is_phone_reachable
 
 logger = logging.getLogger("rocky.bot")
 
@@ -433,8 +433,59 @@ async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id:
 
     settings: Settings = context.bot_data["settings"]
     session_data = _play_sessions.get(play_key)
-
     try:
+        # If this is the ADB virtual device, lazy-launch Jellyfin on the phone first
+        if device.get("is_adb_virtual"):
+            try:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=f"📱 Rocky prepare phone for *{movie_name}*...",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            adb_ok = await adb_wake_and_launch(
+                settings.adb_phone_ip,
+                settings.adb_phone_package,
+                settings.adb_phone_activity,
+                port=settings.adb_phone_port,
+                wait=4,
+            )
+            if not adb_ok:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=f"Cannot reach phone via ADB. Phone on? WiFi connected?",
+                    parse_mode="Markdown",
+                )
+                return
+            # Now find the phone's real Jellyfin session
+            client = JellyfinClient(
+                base_url=settings.jellyfin_url,
+                api_key=settings.jellyfin_api_key,
+                username=settings.jellyfin_username,
+            )
+            device_list = await asyncio.wait_for(
+                asyncio.to_thread(client.list_devices),
+                timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+            )
+            phone_session = None
+            for d in device_list:
+                if _is_adb_phone_device(d.label, settings):
+                    phone_session = d
+                    break
+            if not phone_session:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=f"Phone Jellyfin not registering. Try open Jellyfin app on phone first.",
+                    parse_mode="Markdown",
+                )
+                return
+            # Replace the virtual device with the real session
+            device = {"label": phone_session.label, "session_id": phone_session.session_id}
+
         client = JellyfinClient(
             base_url=settings.jellyfin_url,
             api_key=settings.jellyfin_api_key,
@@ -481,39 +532,55 @@ async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id:
         _reset_rocky_state(context.user_data, full=True)
 
 
-async def _adb_pre_wake_phone(settings: Settings, chat_id: Optional[int] = None, bot = None) -> None:
-    """If ADB phone is configured, wake + launch Jellyfin before listing devices.
+async def _adb_ensure_connected(settings: Settings) -> bool:
+    """If ADB phone is configured, just ensure ADB connectivity (no Jellyfin launch).
 
-    This ensures the phone's Jellyfin session registers so it appears in the device list.
+    Returns True if the phone is reachable via ADB, False otherwise.
+    The phone is NOT woken or launched here — that happens lazily when the user
+    picks the phone from the device picker.
     """
     if not settings.adb_phone_ip:
-        return
+        return False
     try:
-        if bot and chat_id:
-            await bot.send_message(chat_id, "Rocky prepare phone. Small wait...")
-        adb_ok = await adb_wake_and_launch(
+        reachable = await adb_is_phone_reachable(
             settings.adb_phone_ip,
-            settings.adb_phone_package,
-            settings.adb_phone_activity,
-            wait=4,
+            port=settings.adb_phone_port,
         )
-        if adb_ok:
-            logger.info("ADB pre-wake succeeded for %s", settings.adb_phone_ip)
+        if reachable:
+            logger.info("ADB phone reachable at %s", settings.adb_phone_ip)
         else:
-            logger.warning("ADB pre-wake failed for %s", settings.adb_phone_ip)
+            logger.warning("ADB phone not reachable at %s", settings.adb_phone_ip)
+        return reachable
     except Exception as exc:
-        logger.warning("ADB pre-wake error: %s", exc)
+        logger.warning("ADB connectivity check error: %s", exc)
+        return False
 
 
-async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, movie: dict) -> None:
-    """Show device selection buttons after user picks a movie."""
-    context.user_data["selected_movie"] = movie
-    context.user_data["rocky_state"] = STATE_DEVICE_PICKING
-    settings: Settings = context.bot_data["settings"]
-    query = update.callback_query
+def _is_adb_phone_device(label: str, settings: Settings) -> bool:
+    """Check if a device label corresponds to the ADB-controlled phone."""
+    if not settings.adb_phone_ip:
+        return False
+    # Common phone client names from Jellyfin
+    phone_keywords = ("phone", "mobile", "android")
+    label_lower = label.lower()
+    return any(kw in label_lower for kw in phone_keywords)
 
-    # Pre-wake phone via ADB so it registers as a Jellyfin device
-    await _adb_pre_wake_phone(settings)
+
+async def _list_devices_with_phone(settings: Settings) -> list[dict]:
+    """List Jellyfin devices and add the ADB phone as a virtual option if reachable.
+
+    Instead of pre-launching Jellyfin on the phone (which made it auto-play),
+    we just check if the phone is reachable via ADB and add it as a device
+    option with a placeholder session_id. When the user picks the phone,
+    Jellyfin is launched on it lazily.
+
+    Device labels are renamed for friendlier display.
+    """
+    # Friendly display names for known devices (lowercase keyword → display label)
+    _device_renames = {
+        "chrome": "Roshin's Mac",
+        "browser": "Roshin's Mac",
+    }
 
     devices = []
     try:
@@ -526,9 +593,47 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
             asyncio.to_thread(client.list_devices),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
-        devices = [{"label": d.label, "session_id": d.session_id} for d in device_list]
+        for d in device_list:
+            label = d.label
+            label_lower = label.lower()
+            # Rename known devices
+            for keyword, friendly in _device_renames.items():
+                if keyword in label_lower:
+                    label = friendly
+                    break
+            # If this is the ADB phone, rename it too
+            if _is_adb_phone_device(label, settings):
+                label = "Roshin's Phone"
+            devices.append({"label": label, "session_id": d.session_id})
     except Exception as exc:
-        logger.warning("Failed to list devices for picker: %s", exc)
+        logger.warning("Failed to list Jellyfin devices: %s", exc)
+
+    # If ADB phone is configured and reachable, add it as a virtual device option
+    # (unless it already appears in Jellyfin sessions)
+    adb_reachable = await _adb_ensure_connected(settings)
+    if adb_reachable:
+        # Check if the phone is already in Jellyfin sessions (e.g. Jellyfin already open)
+        phone_already_listed = any(_is_adb_phone_device(d["label"], settings) for d in devices) or \
+            any(d["label"] == "Roshin's Phone" for d in devices)
+        if not phone_already_listed:
+            devices.append({
+                "label": "Roshin's Phone",
+                "session_id": "__adb_phone__",  # placeholder — resolved lazily on pick
+                "is_adb_virtual": True,
+            })
+            logger.info("Added ADB phone as virtual device option")
+
+    return devices
+
+
+async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, movie: dict) -> None:
+    """Show device selection buttons after user picks a movie."""
+    context.user_data["selected_movie"] = movie
+    context.user_data["rocky_state"] = STATE_DEVICE_PICKING
+    settings: Settings = context.bot_data["settings"]
+    query = update.callback_query
+
+    devices = await _list_devices_with_phone(settings)
 
     # Build back button (used in both no-devices and normal paths)
     back_button_row = [
@@ -775,16 +880,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 poster = movie.get("poster_url") or _FALLBACK_POSTER
                 caption = _build_movie_caption(movie)
                 await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown")
-                # Pre-wake phone via ADB so it registers as a Jellyfin device
-                await _adb_pre_wake_phone(settings, chat_id, context.bot)
 
-                # Show device picker
-                try:
-                    client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
-                    device_list = await asyncio.wait_for(asyncio.to_thread(client.list_devices), timeout=_BLOCKING_CALL_TIMEOUT_SECONDS)
-                    devices = [{"label": d.label, "session_id": d.session_id} for d in device_list]
-                except Exception:
-                    devices = []
+                # Show device picker (includes ADB phone as virtual option if reachable)
+                devices = await _list_devices_with_phone(settings)
                 if not devices:
                     await update.message.reply_text(get_rocky_response("no_devices"))
                     _reset_rocky_state(context.user_data, full=True)
@@ -897,24 +995,17 @@ async def _handle_with_brain(
     if action == "play" and tmdb_ids:
         # Gemini says the user wants to play a specific movie
         await _replace_loading(ROCKY_AMAZE)
-        # Pre-wake phone via ADB so it registers as a Jellyfin device
-        await _adb_pre_wake_phone(settings, chat_id, context.bot)
 
-        # Parallelize: fetch movie + Jellyfin devices at the same time
+        # Fetch movie + devices (includes ADB phone as virtual option if reachable)
         db = Database(settings.sqlite_path)
 
         async def _fetch_movie():
             return await asyncio.to_thread(db.get_movie_by_tmdb_id, int(tmdb_ids[0]), settings.justwatch_country)
 
-        async def _fetch_devices():
-            try:
-                client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
-                device_list = await asyncio.wait_for(asyncio.to_thread(client.list_devices), timeout=_BLOCKING_CALL_TIMEOUT_SECONDS)
-                return [{"label": d.label, "session_id": d.session_id} for d in device_list]
-            except Exception:
-                return []
-
-        movie, devices = await asyncio.gather(_fetch_movie(), _fetch_devices())
+        movie, devices = await asyncio.gather(
+            _fetch_movie(),
+            _list_devices_with_phone(settings),
+        )
 
         if movie:
             context.user_data["selected_movie"] = movie
