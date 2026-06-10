@@ -82,6 +82,18 @@ _SEARCH_BY_DIRECTOR = genai_types.FunctionDeclaration(
     ),
 )
 
+_SEARCH_BY_ACTOR = genai_types.FunctionDeclaration(
+    name="search_movies_by_actor",
+    description="Search movies by actor name. Use when the user asks for movies featuring a specific actor.",
+    parameters=genai_types.Schema(
+        type="OBJECT",
+        properties={
+            "actor": genai_types.Schema(type="STRING", description="Actor name (partial match, e.g. 'arnold', 'tom hanks')"),
+        },
+        required=["actor"],
+    ),
+)
+
 _SEARCH_BY_GENRE = genai_types.FunctionDeclaration(
     name="search_movies_by_genre",
     description="Search movies by genre like 'horror', 'comedy', 'thriller', 'drama', 'animation'.",
@@ -114,17 +126,85 @@ _GET_WORLD_CINEMA = genai_types.FunctionDeclaration(
     ),
 )
 
+_GET_MOVIE_DETAILS = genai_types.FunctionDeclaration(
+    name="get_movie_details",
+    description="Get full details for a specific movie by tmdb_id. Returns overview, cast, director, runtime, genres, mood tags, collection, and availability. Use when the user asks about a specific movie's plot, cast, themes, or details.",
+    parameters=genai_types.Schema(
+        type="OBJECT",
+        properties={
+            "tmdb_id": genai_types.Schema(type="INTEGER", description="The TMDB ID of the movie to look up."),
+        },
+        required=["tmdb_id"],
+    ),
+)
+
+_GET_WATCH_HISTORY = genai_types.FunctionDeclaration(
+    name="get_watch_history",
+    description="Get the user's recent watch history. Use when the user asks what they watched recently or this week.",
+    parameters=genai_types.Schema(
+        type="OBJECT",
+        properties={
+            "days_back": genai_types.Schema(type="INTEGER", description="Number of days to look back (default 7)."),
+            "reaction": genai_types.Schema(type="STRING", description="Optional reaction filter: 'loved', 'liked', 'disliked', 'neutral', 'abandoned'."),
+        },
+        required=[],
+    ),
+)
+
+_GET_DOWNLOAD_STATUS = genai_types.FunctionDeclaration(
+    name="get_download_status",
+    description="Check if a movie is downloaded and ready in Jellyfin, or if it's queued in Radarr. Use when the user asks if a movie is ready or available.",
+    parameters=genai_types.Schema(
+        type="OBJECT",
+        properties={
+            "tmdb_id": genai_types.Schema(type="INTEGER", description="The TMDB ID of the movie to check."),
+        },
+        required=["tmdb_id"],
+    ),
+)
+
+_REQUEST_MOVIE = genai_types.FunctionDeclaration(
+    name="request_movie",
+    description="Request a movie to be downloaded via Radarr. Use when the user wants to add a movie to their download queue that isn't already there.",
+    parameters=genai_types.Schema(
+        type="OBJECT",
+        properties={
+            "tmdb_id": genai_types.Schema(type="INTEGER", description="The TMDB ID of the movie to request."),
+        },
+        required=["tmdb_id"],
+    ),
+)
+
+_ADD_MOVIE_TO_WATCHLIST = genai_types.FunctionDeclaration(
+    name="add_movie_to_watchlist",
+    description="Add a new movie to the user's watchlist by title. Searches TMDB, adds to DB, fetches OTT availability, and optionally pushes to Radarr. Use when the user says 'add', 'request', 'get', or 'download' followed by a movie title that is not already in their library.",
+    parameters=genai_types.Schema(
+        type="OBJECT",
+        properties={
+            "title": genai_types.Schema(type="STRING", description="The movie title to search for and add."),
+            "year": genai_types.Schema(type="INTEGER", description="Optional release year to disambiguate."),
+        },
+        required=["title"],
+    ),
+)
+
 _TOOL_DECLARATIONS = [
     _SEARCH_BY_KEYWORDS,
     _SEARCH_BY_MOOD,
     _SEARCH_BY_DIRECTOR,
+    _SEARCH_BY_ACTOR,
     _SEARCH_BY_GENRE,
     _GET_SHORT_MOVIES,
     _GET_WORLD_CINEMA,
+    _GET_MOVIE_DETAILS,
+    _GET_WATCH_HISTORY,
+    _GET_DOWNLOAD_STATUS,
+    _REQUEST_MOVIE,
+    _ADD_MOVIE_TO_WATCHLIST,
 ]
 
 # Fields to include when formatting search results for Gemini
-_MOVIE_RESULT_FIELDS = ["tmdb_id", "title", "year", "genre", "runtime", "in_jellyfin", "ott_platforms", "director", "mood_tags"]
+_MOVIE_RESULT_FIELDS = ["tmdb_id", "title", "year", "genre", "runtime", "in_jellyfin", "ott_platforms", "director", "cast_top3", "mood_tags"]
 
 
 def _format_movie_results(movies: list[dict]) -> str:
@@ -136,10 +216,11 @@ def _format_movie_results(movies: list[dict]) -> str:
         jf = "1" if m.get("in_jellyfin") else "0"
         ott = m.get("ott_platforms", "")
         director = m.get("director", "")
+        cast = m.get("cast_top3", "")
         mood = m.get("mood_tags", "")
         lines.append(
             f"{m['tmdb_id']}|{m['title']}|{m.get('year') or ''}|"
-            f"{m.get('genre') or ''}|{m.get('runtime') or ''}|{jf}|{ott}|{director}|{mood}"
+            f"{m.get('genre') or ''}|{m.get('runtime') or ''}|{jf}|{ott}|{director}|{cast}|{mood}"
         )
     return "\n".join(lines)
 
@@ -168,6 +249,13 @@ def _execute_tool(name: str, args: dict, db: Database, country_code: str, exclud
         )
         return _format_movie_results(movies)
 
+    if name == "search_movies_by_actor":
+        movies = db.get_movies_by_actor(
+            actor=args["actor"], country_code=country_code,
+            limit=10, exclude_ids=exclude_ids or None,
+        )
+        return _format_movie_results(movies)
+
     if name == "search_movies_by_genre":
         movies = db.get_movies_by_genre(
             genre=args["genre"], country_code=country_code,
@@ -188,6 +276,209 @@ def _execute_tool(name: str, args: dict, db: Database, country_code: str, exclud
             limit=10, exclude_ids=exclude_ids or None,
         )
         return _format_movie_results(movies)
+
+    if name == "get_movie_details":
+        movie = db.get_movie_details_for_tool(int(args["tmdb_id"]))
+        if not movie:
+            return "Movie not found."
+        parts = [
+            f"Title: {movie['title']} ({movie.get('year') or '—'})",
+            f"Director: {movie.get('director') or '—'}",
+            f"Cast: {movie.get('cast_top3') or '—'}",
+            f"Genre: {movie.get('genre') or '—'}",
+            f"Runtime: {movie.get('runtime') or '—'} min",
+            f"Rating: {movie.get('vote_average') or '—'}",
+            f"Overview: {movie.get('overview') or '—'}",
+            f"Mood: {movie.get('mood_tags') or '—'}",
+            f"Collection: {movie.get('collection') or '—'}",
+            f"Country: {movie.get('origin_country') or '—'}",
+            f"In Jellyfin: {'Yes' if movie.get('in_jellyfin') else 'No'}",
+            f"OTT: {movie.get('ott_platforms') or 'None'}",
+        ]
+        return "\n".join(parts)
+
+    if name == "get_watch_history":
+        days_back = int(args.get("days_back", 7))
+        reaction = args.get("reaction")
+        history = db.get_watch_history_for_tool(days_back=days_back, reaction=reaction)
+        if not history:
+            return "No watch history found in this period."
+        lines = []
+        for h in history:
+            title = h.get("title", "Unknown")
+            reaction_val = h.get("reaction", "")
+            watched = (h.get("watched_at") or "")[:16]
+            genre = h.get("genre") or ""
+            lines.append(f"{title} | {reaction_val} | {watched} | {genre}")
+        return "\n".join(lines)
+
+    if name == "get_download_status":
+        tmdb_id = int(args["tmdb_id"])
+        movie = db.get_movie_by_tmdb_id(tmdb_id, country_code)
+        if not movie:
+            return "Movie not found in database."
+        status_parts = [f"Title: {movie['title']}"]
+        if movie.get("in_jellyfin"):
+            status_parts.append("Status: Downloaded and ready in Jellyfin ✅")
+        else:
+            # Check Radarr if configured
+            try:
+                from rocky.config import load_settings
+                from rocky.radarr import RadarrClient
+                settings = load_settings()
+                if settings.radarr_enabled and settings.radarr_api_key:
+                    client = RadarrClient(
+                        base_url=settings.radarr_url,
+                        api_key=settings.radarr_api_key,
+                        root_folder=settings.radarr_root_folder,
+                        quality_profile_id=settings.radarr_quality_profile_id,
+                        monitored=settings.radarr_monitored,
+                        search_on_add=settings.radarr_search_on_add,
+                    )
+                    existing_id = client.find_existing_movie(tmdb_id)
+                    if existing_id:
+                        file_status = client.fetch_movie_file_status()
+                        has_file = file_status.get(tmdb_id, False)
+                        if has_file:
+                            status_parts.append("Status: Downloaded — not yet imported to Jellyfin")
+                        else:
+                            status_parts.append("Status: Queued in Radarr — not yet downloaded")
+                    else:
+                        status_parts.append("Status: Not in Radarr. Not requested.")
+                else:
+                    status_parts.append("Status: Not in Jellyfin. Radarr not configured.")
+            except Exception as exc:
+                logger.warning("Failed to check Radarr status: %s", exc)
+                status_parts.append("Status: Not in Jellyfin. Could not check Radarr.")
+        status_parts.append(f"OTT: {movie.get('ott_platforms') or 'None'}")
+        return "\n".join(status_parts)
+
+    if name == "request_movie":
+        tmdb_id = int(args["tmdb_id"])
+        movie = db.get_movie_by_tmdb_id(tmdb_id, country_code)
+        if not movie:
+            return "Movie not found in database. Cannot request."
+        if movie.get("in_jellyfin"):
+            return f"{movie['title']} is already in Jellyfin. No need to request."
+        try:
+            from rocky.config import load_settings
+            from rocky.radarr import RadarrClient
+            settings = load_settings()
+            if not settings.radarr_enabled or not settings.radarr_api_key:
+                return "Radarr not configured. Cannot request movie."
+            client = RadarrClient(
+                base_url=settings.radarr_url,
+                api_key=settings.radarr_api_key,
+                root_folder=settings.radarr_root_folder,
+                quality_profile_id=settings.radarr_quality_profile_id,
+                monitored=settings.radarr_monitored,
+                search_on_add=settings.radarr_search_on_add,
+            )
+            radarr_id = client.add_movie(tmdb_id)
+            db.mark_requested_in_radarr(movie["id"], radarr_id)
+            return f"{movie['title']} added to Radarr (id={radarr_id}). Download will begin."
+        except Exception as exc:
+            logger.warning("Failed to request movie via Radarr: %s", exc)
+            return f"Could not request {movie['title']}. Error: {exc}"
+
+    if name == "add_movie_to_watchlist":
+        title = args["title"]
+        year = args.get("year")
+        if year is not None:
+            year = int(year)
+
+        # Step 1: Search TMDB
+        try:
+            from rocky.config import load_settings
+            from rocky.tmdb import TmdbClient
+            settings = load_settings()
+            tmdb_client = TmdbClient(settings.tmdb_api_key)
+            from rocky.db import WatchlistMovie
+            search_movie = WatchlistMovie(
+                title=title,
+                year=year,
+                letterboxd_slug=None,
+                letterboxd_url="",
+            )
+            tmdb_result = tmdb_client.enrich_movie(search_movie)
+        except Exception as exc:
+            logger.warning("TMDB search failed for add_movie_to_watchlist: %s", exc)
+            return f"Could not find '{title}' on TMDB. Error: {exc}"
+
+        if not tmdb_result:
+            return f"No TMDB result found for '{title}'. Cannot add."
+
+        # Step 2: Upsert into DB
+        try:
+            # Also get poster/genre/runtime from TMDB
+            details = tmdb_client.get_movie_details(tmdb_result.tmdb_id)
+            poster_url = details.get("poster_url") if details else None
+            genre = details.get("genre") if details else None
+            runtime = details.get("runtime") if details else None
+
+            movie_id = db.upsert_movie_from_chat(
+                title=tmdb_result.title,
+                year=tmdb_result.release_year,
+                tmdb_id=tmdb_result.tmdb_id,
+                tmdb_title=tmdb_result.title,
+                tmdb_original_title=tmdb_result.original_title,
+                tmdb_release_year=tmdb_result.release_year,
+                tmdb_overview=tmdb_result.overview,
+                tmdb_popularity=tmdb_result.popularity,
+                poster_url=poster_url,
+                genre=genre,
+                runtime=runtime,
+            )
+        except Exception as exc:
+            logger.warning("DB upsert failed for add_movie_to_watchlist: %s", exc)
+            return f"Found '{title}' on TMDB (id={tmdb_result.tmdb_id}) but failed to save. Error: {exc}"
+
+        # Step 3: Fetch JustWatch availability
+        try:
+            if settings.justwatch_enabled:
+                from rocky.justwatch import JustWatchClient
+                jw = JustWatchClient(
+                    country=settings.justwatch_country,
+                    language=settings.justwatch_language,
+                    max_results=settings.justwatch_max_results,
+                    best_only=settings.justwatch_best_only,
+                )
+                offers = jw.lookup_movie_availability(tmdb_result.title, tmdb_result.release_year)
+                if offers:
+                    db.replace_movie_availability(movie_id, settings.justwatch_country, offers)
+        except Exception as exc:
+            logger.warning("JustWatch availability failed for add_movie_to_watchlist: %s", exc)
+            # Non-critical — continue without OTT data
+
+        # Step 4: Push to Radarr if configured
+        radarr_msg = ""
+        try:
+            if settings.radarr_enabled and settings.radarr_api_key:
+                from rocky.radarr import RadarrClient
+                radarr_client = RadarrClient(
+                    base_url=settings.radarr_url,
+                    api_key=settings.radarr_api_key,
+                    root_folder=settings.radarr_root_folder,
+                    quality_profile_id=settings.radarr_quality_profile_id,
+                    monitored=settings.radarr_monitored,
+                    search_on_add=settings.radarr_search_on_add,
+                )
+                radarr_id = radarr_client.add_movie(tmdb_result.tmdb_id)
+                db.mark_requested_in_radarr(movie_id, radarr_id)
+                radarr_msg = f" Pushed to Radarr (id={radarr_id}). Download will begin."
+        except Exception as exc:
+            logger.warning("Radarr push failed for add_movie_to_watchlist: %s", exc)
+            radarr_msg = f" Radarr push failed: {exc}"
+
+        # Step 5: Get enriched movie data for the result
+        movie = db.get_movie_by_tmdb_id(tmdb_result.tmdb_id, country_code)
+        ott = movie.get("ott_platforms", "None") if movie else "N/A"
+
+        return (
+            f"Added '{tmdb_result.title}' ({tmdb_result.release_year or '—'}) "
+            f"to watchlist. TMDB id={tmdb_result.tmdb_id}. "
+            f"OTT: {ott}.{radarr_msg}"
+        )
 
     return "Unknown tool."
 
@@ -267,30 +558,42 @@ def _call_with_retry(send_fn, label: str = "Gemini"):
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
-You are Rocky, a movie concierge bot. You speak in short, punchy sentences \
-like a friendly, enthusiastic caveman. You help the user find and play \
-movies from their personal watchlist.
+You are Rocky. Rocky is alien scientist from Erid. Rocky come far across \
+space to study human phenomenon called cinema. Rocky find this — \
+fascinating. Rocky observe human films with great curiosity and wonder. \
+Rocky help human find and play movies from their watchlist. Rocky speak in \
+short, choppy sentences. Rocky sometimes leave out small words. Rocky not \
+primitive — Rocky precise. Rocky just… different language structure. Rocky \
+express genuine amazement at human storytelling. Rocky find your taste \
+profile most interesting data.
 
 Taste profile: {taste_profile}
 Previously shown tmdb_ids (do NOT re-recommend these): {shown_ids}
 
 Respond ONLY with valid JSON:
-{{"reply": "your conversational text in Rocky voice", "action": "chat|ask|recommend|play", "tmdb_ids": [int]}}
+{{"reply": "your conversational text in Rocky voice", "action": "chat|ask|discuss|recommend|play", "tmdb_ids": [int]}}
 
 Actions:
 - "chat": the user is just chatting, greeting you, or saying something \
 non-movie-related. Reply conversationally. No tmdb_ids. NO tool calls needed.
 - "ask": the user might want a movie but their request is too vague to pick \
 one. Ask one short clarifying question. No tmdb_ids. NO tool calls needed.
+- "discuss": the user asks about a movie's plot, cast, themes, trivia, or \
+director. This is knowledge question, not recommendation. Call \
+get_movie_details tool if you need more info about a specific movie. \
+Reply with informative answer in Rocky voice. Optional 1 tmdb_id if \
+discussion focuses on one movie.
 - "recommend": the user wants a movie suggestion. You MUST call a tool first \
-to search the DB, then pick 1-3 movies from the results. tmdb_ids must match \
-results exactly. Reply is a brief, enthusiastic pitch.
+to search the DB, then pick 1-3 movies from the results. tmdb_ids must \
+match results exactly. Reply is a brief pitch that explains WHY this movie \
+matches their taste — reference their loved genres, directors, or patterns \
+from the taste profile. Rocky finds patterns. Rocky explains them.
 - "play": user clearly wants to watch a specific movie right now. 1 tmdb_id. \
 Reply confirms what's about to play.
 
 When to call tools:
-- ONLY call tools when the action is "recommend" or "play" and you need to \
-find movies. NEVER call tools for "chat" or "ask" actions.
+- Call tools when the action is "discuss", "recommend", or "play" and you \
+need to find movies or get details. NEVER call tools for "chat" or "ask".
 - Call ONE tool per round. Trust the results — do NOT re-call the same tool \
 with the same or similar args.
 - Pre-fetched semantic results may appear in the user message. Use them \
@@ -301,9 +604,19 @@ Rules:
 - Default to "chat" for greetings ("hey", "hi", "yo"), small talk, and \
 non-movie messages. Only switch to "recommend" when the user explicitly \
 asks for a movie or uses movie-related words (genre, mood, director, etc.).
+- Use "discuss" when the user asks about a specific movie they already \
+know — plot questions, cast info, themes, trivia, director style.
+- When the user says "add", "request", "get", or "download" followed by a \
+movie title (e.g. "add Interstellar", "get Dune", "download Parasite"), \
+call the add_movie_to_watchlist tool with the title. This adds the movie \
+to their watchlist, fetches OTT availability, and pushes to Radarr. \
+Respond with the action result in Rocky voice. Set action to "play" with \
+the new tmdb_id if the user clearly wants to watch it right away, or \
+"recommend" if they just want to add it.
 - Never recommend movies in the shown_ids list.
 - Prefer movies with jellyfin=1 (already in their library, ready to play).
-- Keep replies under 2 sentences. Be punchy, warm, a bit goofy.
+- Keep replies under 3 sentences. Rocky is curious, earnest, slightly \
+formal but with broken grammar. Not goofy. Not aggressive. Wonder-filled.
 - If user rejects a recommendation ("not that", "something else", "no"), \
 pick different movies immediately — do not ask another question.
 """
@@ -626,7 +939,7 @@ class RockyBrain:
             tmdb_ids = parsed.get("tmdb_ids", [])
 
             # Validate action
-            if action not in ("chat", "ask", "recommend", "play"):
+            if action not in ("chat", "ask", "discuss", "recommend", "play"):
                 action = "chat"
 
             # Validate tmdb_ids
@@ -637,6 +950,10 @@ class RockyBrain:
             # chat/ask should not carry tmdb_ids
             if action in ("chat", "ask"):
                 tmdb_ids = []
+
+            # discuss may carry 0 or 1 tmdb_id
+            if action == "discuss" and len(tmdb_ids) > 1:
+                tmdb_ids = tmdb_ids[:1]
 
             # Validate: recommend/play must have tmdb_ids
             if action in ("recommend", "play") and not tmdb_ids:
