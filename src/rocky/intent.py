@@ -1,9 +1,10 @@
-"""Local intent classifier — DIRECT_PLAY and casual message detection.
+"""Local intent classifier — DIRECT_PLAY, WATCHED_LOG, and casual message detection.
 
 Detects direct play requests ("play X", "watch X") which skip Gemini
-to go straight to the device picker. Also detects casual/greeting
-messages ("hey", "hi", "yo") which should get a local response asking
-what the user wants to watch, instead of being sent to Gemini.
+to go straight to the device picker. Detects watch-logging requests
+("watched X", "finished X") which skip Gemini to log locally. Also
+detects casual/greeting messages ("hey", "hi", "yo") which should get
+a local response instead of being sent to Gemini.
 """
 from __future__ import annotations
 
@@ -15,6 +16,14 @@ _PLAY_PATTERNS = [
     r"^watch\s+(?:on\s+)?",
     r"^put\s+on\s+",
     r"^start\s+",
+]
+
+# Watch-logging patterns — messages that log a movie as watched
+# Single comprehensive pattern handles: "watched X", "just watched X",
+# "I watched X", "I've watched X", "Rocky, I watched X", etc.
+_WATCHED_PREFIX = r"^(?:rocky[,!]?\s+)?(?:i\s*(?:'ve\s+)?(?:just\s+)?)?(?:just\s+)?(?:watched|finished|completed|saw)\s+"
+_WATCHED_PATTERNS = [
+    _WATCHED_PREFIX,
 ]
 
 # Casual/greeting patterns — messages that are just small talk, not movie requests
@@ -56,6 +65,28 @@ def extract_play_title(message: str) -> str:
         lower = re.sub(pat, "", lower, count=1).strip()
     # Remove trailing device references
     lower = re.sub(r"\s+on\s+(?:my\s+)?(?:tv|phone|laptop|chrome|computer|ipad|iphone)\s*$", "", lower, flags=re.IGNORECASE)
+    return lower.strip()
+
+
+def is_watched_log(message: str) -> bool:
+    """Check if message is a watch-logging request: 'watched X', 'finished X', etc."""
+    lower = message.strip().lower()
+    return any(re.search(pat, lower) for pat in _WATCHED_PATTERNS)
+
+
+def extract_watched_title(message: str) -> str:
+    """Extract the movie title from a watch-log message.
+
+    'watched Parasite' → 'Parasite'
+    'just finished Inception' → 'Inception'
+    'Rocky, I saw The Matrix' → 'The Matrix'
+    """
+    lower = message.strip()
+    for pat in _WATCHED_PATTERNS:
+        lower = re.sub(pat, "", lower, count=1).strip()
+    # Clean up residual punctuation and filler words
+    lower = re.sub(r"^[,!]+\s*", "", lower)
+    lower = re.sub(r"[.,!?]+$", "", lower)
     return lower.strip()
 
 
