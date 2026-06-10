@@ -41,6 +41,7 @@ def _movie_to_text(movie: dict) -> str:
         str(movie.get("year", "") or ""),
         movie.get("genre", ""),
         movie.get("director", ""),
+        movie.get("cast_top3", ""),
         movie.get("mood_tags", ""),
         movie.get("tmdb_overview", ""),
     ]
