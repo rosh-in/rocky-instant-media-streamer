@@ -2,8 +2,10 @@
 
 Architecture:
 - DIRECT_PLAY fast-path (local, no Gemini) → "play X" goes straight to device picker
+- WATCHED_LOG fast-path (local, no Gemini) → "watched X" logs to watch history
 - RockyBrain (Gemini conversational brain) → handles everything else naturally
-- Card System (unchanged) → poster cards with navigation
+- Card System → poster cards with navigation
+- Inline Mode → @rocky_bot <query> searches movies from any chat
 """
 from __future__ import annotations
 import asyncio
@@ -14,10 +16,11 @@ from collections import deque
 from typing import Optional
 import requests
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MenuButtonCommands, ReplyKeyboardRemove, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputMediaPhoto, InputTextMessageContent, MenuButtonCommands, ReplyKeyboardRemove, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     CallbackQueryHandler,
+    InlineQueryHandler,
     MessageHandler,
     MessageReactionHandler,
     CommandHandler,
@@ -29,7 +32,7 @@ from telegram.ext import (
 from rocky.config import Settings, load_settings
 from rocky.db import Database
 from rocky.gemini import RockyBrain
-from rocky.intent import is_direct_play, extract_play_title, is_casual_message
+from rocky.intent import is_direct_play, extract_play_title, is_casual_message, is_watched_log, extract_watched_title
 from rocky.jellyfin import JellyfinClient
 from rocky.rocky_dialogue import ROCKY_AMAZE, get_rocky_response
 from rocky.stats import generate_stats
@@ -199,14 +202,14 @@ def _is_rate_limited(update: Update, settings: Settings) -> bool:
 
 async def _notify_denied(update: Update) -> None:
     if update.callback_query:
-        await update.callback_query.answer("Rocky not know you. Bot private.", show_alert=True)
+        await update.callback_query.answer("Rocky does not recognize you. Bot is private.", show_alert=True)
         return
     if update.effective_message:
-        await update.effective_message.reply_text("Rocky not know you. Bot private.")
+        await update.effective_message.reply_text("Rocky does not recognize you. Bot is private.")
 
 
 async def _notify_rate_limited(update: Update) -> None:
-    text = "Too many request. Rocky need moment. Wait, try again."
+    text = "Too many requests. Rocky need moment. Wait, then try again."
     if update.callback_query:
         await update.callback_query.answer(text, show_alert=True)
         return
@@ -235,13 +238,13 @@ async def _guard_update(update: Update, context: ContextTypes.DEFAULT_TYPE, *, a
 def _friendly_error_message(exc: Exception, fallback: str) -> str:
     msg = str(exc).lower()
     if isinstance(exc, asyncio.TimeoutError):
-        return "Rocky wait too long. Try again?"
+        return "Rocky wait too long. Timeout. Try again?"
     if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-        return "Rocky brain full right now. Wait moment, try again."
+        return "Rocky brain at capacity right now. Wait moment, try again."
     if isinstance(exc, requests.exceptions.Timeout) or "timed out" in msg:
-        return "Service timeout. Rocky try again later, yes?"
+        return "Service timeout. Rocky try again later."
     if isinstance(exc, requests.exceptions.ConnectionError) or "connection" in msg:
-        return "Rocky cannot reach service. Try again soon."
+        return "Rocky cannot reach service. Connection issue. Try again soon."
     if "jellyfin user" in msg and "not found" in msg:
         return "Jellyfin user not found. Check JELLYFIN_USERNAME."
     return fallback
@@ -267,24 +270,55 @@ def _reset_rocky_state(user_data: dict, full: bool = True) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MarkdownV2 escape helper
+# ---------------------------------------------------------------------------
+def _mdv2_escape(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2 parse mode."""
+    for ch in ("_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Visual recommendation helpers (unchanged)
 # ---------------------------------------------------------------------------
 def _build_movie_caption(movie: dict) -> str:
-    year = movie.get("year") or "—"
-    genre = movie.get("genre") or "—"
-    runtime = movie.get("runtime") or "—"
+    """Build a movie card caption in MarkdownV2 format."""
+    title = _mdv2_escape(movie.get("title") or "—")
+    year = _mdv2_escape(str(movie.get("year") or "—"))
+    genre = (movie.get("genre") or "—").replace("/", " · ")
+    genre_esc = _mdv2_escape(genre)
+    runtime = movie.get("runtime")
     rating = movie.get("vote_average")
-    rating_str = f"⭐ {rating:.1f}" if rating else ""
     director = movie.get("director")
-    avail = "✅ Jellyfin" if movie.get("in_jellyfin") else f"🎬 {movie.get('ott_platforms', 'Not available')}"
-    parts = [f"*{movie['title']}* ({year})"]
-    info_parts = [f"🎬 {genre}", f"{runtime}m"]
-    if rating_str:
-        info_parts.append(rating_str)
-    parts.append(" • ".join(info_parts))
+
+    parts = []
+    parts.append(f"🎬 *{title}* \\({year}\\)")
+    parts.append("")
+    parts.append(f"_{genre_esc}_")
+
+    # Detail line: ⭐ 7.5 · 140 min · Director
+    detail_parts = []
+    if rating:
+        detail_parts.append(f"⭐ {_mdv2_escape(f'{rating:.1f}')}")
+    if runtime:
+        detail_parts.append(_mdv2_escape(f"{runtime} min"))
     if director:
-        parts.append(f"🎥 {director}")
-    parts.append(avail)
+        detail_parts.append(_mdv2_escape(director))
+    if detail_parts:
+        parts.append(" · ".join(detail_parts))
+
+    parts.append("")
+    parts.append("\\-\\-")
+    parts.append("")
+
+    # Availability
+    if movie.get("in_jellyfin"):
+        parts.append("✅ Jellyfin")
+    else:
+        ott = movie.get("ott_platforms", "Not available")
+        parts.append(f"🎬 {_mdv2_escape(ott)}")
+
     return "\n".join(parts)
 
 
@@ -366,10 +400,10 @@ async def send_first_card(update: Update, context: ContextTypes.DEFAULT_TYPE, mo
     keyboard = _build_movie_keyboard(movie, 0, total)
 
     try:
-        await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+        await update.message.reply_photo(photo=poster, caption=caption, parse_mode="MarkdownV2", reply_markup=keyboard)
     except Exception as exc:
         logger.warning("Photo send failed, falling back to text: %s", exc)
-        await update.message.reply_text(text=caption, parse_mode="Markdown", reply_markup=keyboard)
+        await update.message.reply_text(text=caption, parse_mode="MarkdownV2", reply_markup=keyboard)
 
 
 async def show_movie_card(query, context: ContextTypes.DEFAULT_TYPE, movies: list[dict], index: int) -> None:
@@ -392,39 +426,38 @@ async def show_movie_card(query, context: ContextTypes.DEFAULT_TYPE, movies: lis
 
     try:
         await query.edit_message_media(
-            media=InputMediaPhoto(media=poster, caption=caption, parse_mode="Markdown"),
+            media=InputMediaPhoto(media=poster, caption=caption, parse_mode="MarkdownV2"),
             reply_markup=keyboard,
         )
     except Exception as exc:
         logger.warning("edit_message_media failed, trying caption: %s", exc)
         try:
-            await query.edit_message_caption(caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+            await query.edit_message_caption(caption=caption, parse_mode="MarkdownV2", reply_markup=keyboard)
         except Exception as exc2:
             logger.warning("edit_message_caption also failed: %s", exc2)
 
 
 async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, movie_name: str, device: dict, play_key: int) -> None:
     """Background task: countdown 10s then execute playback unless undone."""
-    for remaining in range(10, 0, -1):
+    for remaining in range(4, 0, -1):
         await asyncio.sleep(1)
         # Check if undone
         if not context.user_data.get("pending_play"):
             return
-        # Update countdown label every 2 seconds
-        if remaining % 2 == 0 and remaining > 0:
-            try:
-                await context.bot.edit_message_reply_markup(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            f"↩ Undo — {remaining}s",
-                            callback_data=json.dumps({"action": "undo"}),
-                        ),
-                    ]]),
-                )
-            except Exception:
-                pass  # Message may have been edited by undo tap
+        # Update countdown label every second
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        f"↩ Undo — {remaining}s",
+                        callback_data=json.dumps({"action": "undo"}),
+                    ),
+                ]]),
+            )
+        except Exception:
+            pass  # Message may have been edited by undo tap
 
     # Countdown finished — check if still pending
     pending = context.user_data.get("pending_play")
@@ -456,7 +489,7 @@ async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 await context.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
-                    caption=f"Cannot reach phone via ADB. Phone on? WiFi connected?",
+                    caption=f"Cannot reach phone via ADB. Phone powered on? WiFi connected?",
                     parse_mode="Markdown",
                 )
                 return
@@ -479,7 +512,7 @@ async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 await context.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
-                    caption=f"Phone Jellyfin not registering. Try open Jellyfin app on phone first.",
+                    caption=f"Phone Jellyfin not registering. Try opening Jellyfin app on phone first.",
                     parse_mode="Markdown",
                 )
                 return
@@ -508,11 +541,19 @@ async def _execute_delayed_playback(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 parse_mode="Markdown",
             )
             logger.info("Playback triggered: %s on %s", movie_name, device["label"])
+            # Post-playback nudge — ask what's next instead of going silent
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=get_rocky_response("post_play", title=movie_name),
+                )
+            except Exception:
+                pass  # Non-critical — don't let nudge failure break playback
         else:
             await context.bot.edit_message_caption(
                 chat_id=chat_id,
                 message_id=message_id,
-                caption=f"*{movie_name}* not in Jellyfin library. Rocky sad.",
+                caption=f"*{movie_name}* not in Jellyfin library. Rocky cannot find.",
                 parse_mode="Markdown",
             )
     except Exception as exc:
@@ -693,7 +734,7 @@ async def send_device_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
     button_rows.append(back_button_row)
     keyboard = InlineKeyboardMarkup(button_rows)
     await query.edit_message_caption(
-        caption=f"*{movie['title']}* — where you want watch?",
+        caption=f"*{movie['title']}* — where do you want to watch?",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -721,17 +762,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard_update(update, context):
         return
     text = (
-        "Rocky online.\n\n"
-        "Rocky = movie friend. Rocky find movie you want watch.\n"
-        "Rocky play movie on TV or phone or laptop.\n"
-        "Rocky remember what you like. Rocky get better over time.\n\n"
-        "Tell Rocky:\n"
-        "— Mood (\"something sad\" or \"make me laugh\")\n"
-        "— Movie name (\"play Inception\")\n"
-        "— Or just talk. Rocky understand.\n\n"
-        "Fist bump. Begin?"
+        "🪨 *Rocky is online\\.*\n"
+        "Grace Rocky save movies\\.\n\n"
+        "Tell Rocky:\n\n"
+        "🎭 *A mood* — _\"something I can\\'t stop thinking about\"_\n"
+        "🎬 *A title* — _\"play Obsession\"_\n"
+        "💬 *Anything* — _Rocky will figure it out\\._"
     )
-    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=ReplyKeyboardRemove())
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -757,13 +795,13 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     settings: Settings = context.bot_data["settings"]
     if not settings.jellyfin_api_key or not settings.jellyfin_username:
-        await update.message.reply_text("Jellyfin not configured yet. Rocky need this.")
+        await update.message.reply_text("Jellyfin not configured yet. Rocky requires this.")
         return
     try:
         client = JellyfinClient(base_url=settings.jellyfin_url, api_key=settings.jellyfin_api_key, username=settings.jellyfin_username)
         devices = await asyncio.wait_for(asyncio.to_thread(client.list_devices), timeout=_BLOCKING_CALL_TIMEOUT_SECONDS)
         if not devices:
-            await update.message.reply_text("No active device. Open Jellyfin on device first.")
+            await update.message.reply_text("No active device. Open Jellyfin on device first, then try.")
             return
         lines = [f"Active device ({len(devices)}):\n"]
         for d in devices:
@@ -771,7 +809,7 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("\n".join(lines))
     except Exception as exc:
         logger.exception("Device listing failed")
-        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot list device right now. Try again."))
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot list devices right now. Try again."))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -796,7 +834,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("\n".join(lines))
     except Exception as exc:
         logger.exception("Status request failed")
-        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot fetch status right now. Try again."))
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot fetch status right now. Try again later."))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -808,10 +846,10 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             asyncio.to_thread(generate_stats, settings.sqlite_path, settings.justwatch_country),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
-        await update.message.reply_text(stats_text, parse_mode="Markdown")
+        await update.message.reply_text(stats_text, parse_mode="MarkdownV2")
     except Exception as exc:
         logger.exception("Stats generation failed")
-        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot count things right now. Try again."))
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot calculate right now. Try again."))
 
 
 async def send_weekly_stats(bot, settings: Settings) -> None:
@@ -824,7 +862,7 @@ async def send_weekly_stats(bot, settings: Settings) -> None:
             asyncio.to_thread(generate_stats, settings.sqlite_path, settings.justwatch_country),
             timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
         )
-        await bot.send_message(chat_id=chat_id, text=stats_text, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=stats_text, parse_mode="MarkdownV2")
         logger.info("Weekly stats card sent to chat_id=%s", chat_id)
     except Exception as exc:
         logger.exception("Weekly stats send failed")
@@ -842,7 +880,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lock = _get_chat_lock(chat_id)
 
     if not settings.gemini_api_key:
-        await update.message.reply_text("GEMINI_API_KEY not configured. Rocky brain missing.")
+        await update.message.reply_text("GEMINI_API_KEY not configured. Rocky brain not available.")
         return
 
     user_text = update.message.text or ""
@@ -858,6 +896,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # ------------------------------------------------------------------
         if is_casual_message(user_text) and state not in (STATE_DEVICE_PICKING, STATE_PLAYING):
             await update.message.reply_text(get_rocky_response("greeting"))
+            return
+
+        # ------------------------------------------------------------------
+        # Fast path: WATCHED_LOG — "watched X", "finished X" → log locally
+        # ------------------------------------------------------------------
+        if is_watched_log(user_text) and state not in (STATE_DEVICE_PICKING, STATE_PLAYING):
+            log_title = extract_watched_title(user_text)
+            if log_title:
+                db = Database(settings.sqlite_path)
+                await asyncio.wait_for(
+                    asyncio.to_thread(db.log_watch_history, tmdb_id=None, title=log_title, reaction="liked", reaction_emoji="👍"),
+                    timeout=10,
+                )
+                await update.message.reply_text(f"Rocky note: *{log_title}* logged as watched 👍", parse_mode="Markdown")
             return
 
         # ------------------------------------------------------------------
@@ -879,7 +931,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 # Send poster card
                 poster = movie.get("poster_url") or _FALLBACK_POSTER
                 caption = _build_movie_caption(movie)
-                await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown")
+                await update.message.reply_photo(photo=poster, caption=caption, parse_mode="MarkdownV2")
 
                 # Show device picker (includes ADB phone as virtual option if reachable)
                 devices = await _list_devices_with_phone(settings)
@@ -929,11 +981,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # ------------------------------------------------------------------
-        # STATE: DEVICE_PICKING or PLAYING — ignore new text
+        # STATE: DEVICE_PICKING or PLAYING — cancel current flow if user
+        # sends a substantive new message; ignore casual messages
         # ------------------------------------------------------------------
         if state in (STATE_DEVICE_PICKING, STATE_PLAYING):
-            await update.message.reply_text("Pick device first. Or type /reset to start over.")
-            return
+            if is_casual_message(user_text):
+                # Brief hint for casual messages during active flow
+                await update.message.reply_text("Rocky busy with playback. Pick device, or say something new.")
+                return
+            # Substantive new message — cancel current flow and re-route
+            logger.info("New message during %s, cancelling flow and re-routing", state)
+            # Clean up pending play if any
+            pending = context.user_data.get("pending_play")
+            if pending:
+                play_key = pending.get("play_key")
+                if play_key:
+                    _play_sessions.pop(play_key, None)
+                context.user_data.pop("pending_play", None)
+            _reset_rocky_state(context.user_data, full=False)
+            # Fall through to process the new message normally
+            state = STATE_IDLE
 
         # ------------------------------------------------------------------
         # Everything else → Gemini brain (handles IDLE and SHOWING_CARDS)
@@ -960,7 +1027,7 @@ async def _handle_with_brain(
         seen_ids = list(set(seen_ids + shown_from_cards))
 
     # Send immediate loading indicator
-    loading_msg = await update.message.reply_text("🪨 Rocky process...")
+    loading_msg = await update.message.reply_text("🪨 Rocky processing...")
 
     # Call Gemini brain
     try:
@@ -1014,7 +1081,7 @@ async def _handle_with_brain(
             # Show poster + device picker
             poster = movie.get("poster_url") or _FALLBACK_POSTER
             caption = _build_movie_caption(movie)
-            await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown")
+            await update.message.reply_photo(photo=poster, caption=caption, parse_mode="MarkdownV2")
             if not devices:
                 await update.message.reply_text(get_rocky_response("no_devices"))
                 _reset_rocky_state(context.user_data, full=True)
@@ -1053,6 +1120,11 @@ async def _handle_with_brain(
         else:
             # Movie not in DB — just send the reply
             await _replace_loading(reply)
+        return
+
+    if action == "discuss":
+        # Gemini is providing movie knowledge — just send the conversational reply
+        await _replace_loading(reply)
         return
 
     if action == "recommend" and tmdb_ids:
@@ -1114,6 +1186,11 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if m.get("tmdb_id") == tmdb_id:
                 selected = m
                 break
+        # Also check selected_movie (set by /surprise and direct-play paths)
+        if not selected:
+            sel = context.user_data.get("selected_movie")
+            if sel and sel.get("tmdb_id") == tmdb_id:
+                selected = sel
         if not selected:
             await query.edit_message_caption(caption="Invalid selection.")
             return
@@ -1210,7 +1287,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "movie": movie_name,
             "device": device,
             "play_key": play_key,
-            "expires": time.time() + 10,
+            "expires": time.time() + 4,
         }
         context.user_data["rocky_state"] = STATE_PLAYING
 
@@ -1220,7 +1297,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    "↩ Undo — 10s",
+                    "↩ Undo — 4s",
                     callback_data=json.dumps({"action": "undo"}),
                 ),
             ]]),
@@ -1263,6 +1340,42 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode="Markdown",
             )
 
+    elif action == "library_page":
+        # Handle pagination for /library command
+        settings: Settings = context.bot_data["settings"]
+        page = data.get("page", 1)
+        db = Database(settings.sqlite_path)
+        try:
+            total = await asyncio.to_thread(db.count_ready_movies)
+            offset = (page - 1) * _LIBRARY_PAGE_SIZE
+            movies = await asyncio.to_thread(
+                db.get_ready_movies,
+                country_code=settings.justwatch_country,
+                limit=_LIBRARY_PAGE_SIZE,
+                offset=offset,
+            )
+            if not movies:
+                await query.edit_message_text("Rocky find no more movies. Last page reached.")
+                return
+            total_pages = (total + _LIBRARY_PAGE_SIZE - 1) // _LIBRARY_PAGE_SIZE
+            text = _build_library_text(movies, total, page, total_pages)
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton(
+                    f"← Page {page - 1}",
+                    callback_data=json.dumps({"action": "library_page", "page": page - 1}),
+                ))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton(
+                    f"Page {page + 1} →",
+                    callback_data=json.dumps({"action": "library_page", "page": page + 1}),
+                ))
+            keyboard = InlineKeyboardMarkup([nav_buttons]) if nav_buttons else None
+            await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+        except Exception as exc:
+            logger.exception("Library pagination failed")
+            await query.edit_message_text(_friendly_error_message(exc, "Rocky cannot read library right now."))
+
     else:
         await query.edit_message_text("Unknown action.")
 
@@ -1299,6 +1412,89 @@ async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ---------------------------------------------------------------------------
+# /surprise command
+# ---------------------------------------------------------------------------
+async def cmd_surprise(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pick exactly ONE movie — decisive, no cards, no navigation."""
+    if not await _guard_update(update, context):
+        return
+    settings: Settings = context.bot_data["settings"]
+    chat_id = update.effective_chat.id
+
+    if not settings.gemini_api_key:
+        await update.message.reply_text("GEMINI_API_KEY not configured. Rocky brain not available.")
+        return
+
+    loading_msg = await update.message.reply_text("Amaze Amaze Amaze. Surprise picking ...")
+
+    try:
+        brain = _get_brain(chat_id, settings)
+        seen_ids = context.user_data.get("seen_ids", [])
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                brain.chat,
+                "Pick exactly ONE movie for me. Be decisive. Give one confident recommendation with a brief reason why. Do not give options.",
+                shown_ids=seen_ids,
+            ),
+            timeout=_BLOCKING_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.exception("Surprise pick failed")
+        try:
+            await loading_msg.edit_text(_friendly_error_message(exc, "Rocky cannot pick right now. Try again."))
+        except Exception:
+            await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot pick right now. Try again."))
+        return
+
+    reply = result.get("reply", "Rocky thinking...")
+    action = result.get("action", "chat")
+    tmdb_ids = result.get("tmdb_ids", [])
+
+    if not tmdb_ids:
+        try:
+            await loading_msg.edit_text(reply or "Rocky could not decide. Try again?")
+        except Exception:
+            await update.message.reply_text(reply or "Rocky could not decide. Try again?")
+        return
+
+    db = Database(settings.sqlite_path)
+    movie = await asyncio.to_thread(db.get_movie_by_tmdb_id, int(tmdb_ids[0]), settings.justwatch_country)
+
+    if not movie:
+        try:
+            await loading_msg.edit_text(reply)
+        except Exception:
+            await update.message.reply_text(reply)
+        return
+
+    # Show single card with Watch Now button only (no nav arrows, no shuffle)
+    context.user_data["selected_movie"] = movie
+    poster = movie.get("poster_url") or _FALLBACK_POSTER
+    caption = _build_movie_caption(movie)
+    action_row = [
+        InlineKeyboardButton(
+            "▶ Watch Now",
+            callback_data=json.dumps({"action": "pick", "tmdb_id": movie["tmdb_id"]}),
+        ),
+    ]
+    trailer_key = movie.get("trailer_key")
+    if trailer_key:
+        action_row.append(InlineKeyboardButton(
+            "🎞 Trailer",
+            url=f"https://www.youtube.com/watch?v={trailer_key}",
+        ))
+    keyboard = InlineKeyboardMarkup([action_row])
+
+    try:
+        await loading_msg.delete()
+    except Exception:
+        pass
+
+    await update.message.reply_photo(photo=poster, caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(reply)
+
+
+# ---------------------------------------------------------------------------
 # /watched command
 # ---------------------------------------------------------------------------
 async def cmd_watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1324,16 +1520,167 @@ async def cmd_watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ---------------------------------------------------------------------------
+# /library command
+# ---------------------------------------------------------------------------
+_LIBRARY_PAGE_SIZE = 20
+
+
+def _build_library_text(movies: list[dict], total: int, page: int, total_pages: int) -> str:
+    """Build the /library message in MarkdownV2 format."""
+    lines = []
+    lines.append(f"🪨 *Ready to watch* — {total} movies")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━")
+    for m in movies:
+        title_esc = _mdv2_escape(m.get("title", "—"))
+        year = m.get("year") or "—"
+        year_esc = _mdv2_escape(str(year))
+        genre = (m.get("genre") or "—").replace("/", " · ")
+        genre_esc = _mdv2_escape(genre)
+        rating = m.get("vote_average")
+        if rating:
+            rating_str = f" · ⭐{rating:.1f}"
+            rating_esc = _mdv2_escape(rating_str)
+        else:
+            rating_esc = ""
+        lines.append(f"🎬 *{title_esc}* \\({year_esc}\\)")
+        lines.append(f"_{genre_esc}_{rating_esc}")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append("_Pick one\\. Rocky will find it\\._")
+    return "\n".join(lines)
+
+
+async def cmd_library(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show paginated list of all downloaded and ready movies."""
+    if not await _guard_update(update, context):
+        return
+    settings: Settings = context.bot_data["settings"]
+    db = Database(settings.sqlite_path)
+
+    try:
+        total = await asyncio.to_thread(db.count_ready_movies)
+        if total == 0:
+            await update.message.reply_text("Rocky observe no downloaded movies yet. Library empty.")
+            return
+
+        # Parse page number from args
+        page = 1
+        if context.args:
+            try:
+                page = int(context.args[0])
+            except (ValueError, IndexError):
+                page = 1
+        if page < 1:
+            page = 1
+
+        offset = (page - 1) * _LIBRARY_PAGE_SIZE
+        movies = await asyncio.to_thread(
+            db.get_ready_movies,
+            country_code=settings.justwatch_country,
+            limit=_LIBRARY_PAGE_SIZE,
+            offset=offset,
+        )
+
+        if not movies:
+            await update.message.reply_text("Rocky find no more movies. Last page reached.")
+            return
+
+        total_pages = (total + _LIBRARY_PAGE_SIZE - 1) // _LIBRARY_PAGE_SIZE
+        text = _build_library_text(movies, total, page, total_pages)
+
+        # Navigation buttons
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton(
+                f"← Page {page - 1}",
+                callback_data=json.dumps({"action": "library_page", "page": page - 1}),
+            ))
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton(
+                f"Page {page + 1} →",
+                callback_data=json.dumps({"action": "library_page", "page": page + 1}),
+            ))
+        keyboard = InlineKeyboardMarkup([nav_buttons]) if nav_buttons else None
+
+        if keyboard:
+            await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+        else:
+            await update.message.reply_text(text, parse_mode="MarkdownV2")
+    except Exception as exc:
+        logger.exception("Library listing failed")
+        await update.message.reply_text(_friendly_error_message(exc, "Rocky cannot read library right now. Try again."))
+
+
+# ---------------------------------------------------------------------------
+# Inline query handler — @rocky_bot search from any chat
+# ---------------------------------------------------------------------------
+_INLINE_MAX_RESULTS = 10
+
+async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline queries — type @rocky_bot <query> in any chat to search movies."""
+    query = update.inline_query
+    if not query or not query.query.strip():
+        await query.answer(results=[], cache_time=10)
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    search_text = query.query.strip()
+
+    try:
+        db = Database(settings.sqlite_path)
+        movies = await asyncio.wait_for(
+            asyncio.to_thread(db.fuzzy_search_title, search_text, settings.justwatch_country, _INLINE_MAX_RESULTS),
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("Inline query search failed: %s", exc)
+        await query.answer(results=[], cache_time=10)
+        return
+
+    if not movies:
+        await query.answer(results=[], cache_time=10)
+        return
+
+    results = []
+    for m in movies:
+        year = m.get("year") or "—"
+        genre = m.get("genre") or "—"
+        runtime = m.get("runtime") or "—"
+        status = "✅ Ready" if m.get("in_jellyfin") else f"🎬 {m.get('ott_platforms', 'N/A')}"
+        title_str = f"{m['title']} ({year})"
+        desc = f"{genre} • {runtime}m | {status}"
+        poster = m.get("poster_url") or _FALLBACK_POSTER
+        tmdb_id = m.get("tmdb_id", 0)
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(tmdb_id),
+                title=title_str,
+                description=desc,
+                thumb_url=poster,
+                input_message_content=InputTextMessageContent(
+                    message_text=f"play {m['title']}",
+                ),
+            )
+        )
+
+    await query.answer(results=results[:_INLINE_MAX_RESULTS], cache_time=30)
+
+
+# ---------------------------------------------------------------------------
 # Bot menu & command registration
 # ---------------------------------------------------------------------------
 _ROCKY_COMMANDS = [
     BotCommand("start", "Start Rocky — show welcome"),
-    BotCommand("devices", "List active Jellyfin devices"),
-    BotCommand("status", "Show watchlist sync status"),
+    BotCommand("surprise", "One decisive movie pick"),
     BotCommand("stats", "Watchlist progress card"),
-    BotCommand("reset", "Reset conversation memory"),
-    BotCommand("watched", "Log a movie as watched"),
+    BotCommand("library", "List downloaded & ready movies"),
 ]
+
+# Handlers for these commands are still registered — they just don't appear
+# in the Telegram menu to keep it clean. /reset and /watched still work.
+_HIDDEN_COMMAND_HANDLERS = ["reset", "watched"]
 
 
 async def _register_bot_menu(application) -> None:
@@ -1368,21 +1715,24 @@ def run_bot() -> None:
     # Conversational handler (all text messages)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Slash commands
+    # Inline query handler — @rocky_bot <query> from any chat
+    app.add_handler(InlineQueryHandler(handle_inline_query))
+
+    # Slash commands (visible in menu: start, surprise, stats, library)
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("devices", cmd_devices))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("surprise", cmd_surprise))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("library", cmd_library))
+
+    # Hidden commands (still work when typed, just not in the menu)
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("watched", cmd_watched))
 
     # Reaction handler
     app.add_handler(MessageReactionHandler(_handle_reaction))
 
-    # /watched command
-    app.add_handler(CommandHandler("watched", cmd_watched))
-
     # Recommendation inline button callback (JSON-based actions)
-    app.add_handler(CallbackQueryHandler(callback_button, pattern=r'^\{\".*\"'))
+    app.add_handler(CallbackQueryHandler(callback_button, pattern=r'^\{".*"'))
 
     # Weekly stats scheduler
     if settings.telegram_chat_id:
