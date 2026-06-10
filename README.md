@@ -261,13 +261,16 @@ Talk to Rocky naturally:
 | Command | What it does |
 |---|---|
 | `/start` | Show onboarding tips |
+| `/surprise` | One decisive movie pick — no options, just Rocky's choice |
 | `/reset` | Clear conversation memory |
 | `/devices` | List active Jellyfin devices |
 | `/status` | Last sync run + library stats |
 | `/stats` | Watchlist progress card |
 | `/watched <title>` | Log a movie as watched |
 
-**Intent routing:** *"Play X"* and *"Watch X"* skip Gemini and go straight to the device picker. Everything else goes to the Gemini brain.
+**Intent routing:** *"Play X"* and *"Watch X"* skip Gemini and go straight to the device picker. Movie knowledge questions (*"What is Inception about?"*) trigger the `discuss` action. Everything else goes to the Gemini brain.
+
+**Gemini tools:** Rocky can now answer questions about your watch history (*"What did I watch this week?"*), check download status (*"Is Inception ready?"*), and request movies directly from chat (*"Download Parasite"*). New arrivals in Jellyfin trigger a push notification to Telegram.
 
 **ADB phone wake:** If `ADB_PHONE_IP` is configured, Rocky automatically wakes the phone screen, unlocks it, and launches the Jellyfin app before showing the device picker.
 
@@ -344,6 +347,7 @@ rocky/
 │   ├── status.py                 # Sync run health checker
 │   ├── play.py                   # Jellyfin playback control
 │   ├── run_webhook.py            # FastAPI webhook launcher
+│   ├── enrich_mood_tags.py       # Batch Gemini mood tag enrichment
 │   ├── dev.rocky.sync.plist      # macOS launchd schedule
 │   └── README.md
 └── src/rocky/
