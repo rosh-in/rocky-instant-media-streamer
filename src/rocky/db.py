@@ -5,6 +5,15 @@ from pathlib import Path
 from typing import Optional
 
 # Mood tags derived from genres
+# Indian OTT provider allowlist — only these platforms are shown in recommendations
+INDIAN_OTT_ALLOWLIST = {
+    "Netflix",
+    "Prime Video",
+    "Hotstar",
+    "SonyLIV",
+    "Airtel Xstream",
+}
+
 MOOD_MAP = {
     "Drama": ["emotional", "heavy", "character-driven"],
     "Comedy": ["light", "fun", "easy watch"],
@@ -64,6 +73,28 @@ class AvailabilityOffer:
     provider_code: Optional[str]
     monetization_type: str
     url: Optional[str]
+
+
+def _ott_for_movie(movie_id: int, country_code: str, conn: sqlite3.Connection) -> str:
+    """Centralized helper: filter raw JustWatch availability to the Indian OTT allowlist.
+
+    Returns a comma-separated string of provider names from the allowlist only.
+    If country_code is not 'IN', returns all providers (no filtering).
+    """
+    ott_rows = conn.execute(
+        """
+        SELECT DISTINCT provider_name
+        FROM availability
+        WHERE movie_id = ? AND country_code = ?
+        """,
+        (movie_id, country_code.upper()),
+    ).fetchall()
+    all_providers = [r["provider_name"] for r in ott_rows]
+    if country_code.upper() != "IN":
+        return ", ".join(all_providers)
+    # Filter to Indian OTT allowlist
+    filtered = [p for p in all_providers if p in INDIAN_OTT_ALLOWLIST]
+    return ", ".join(filtered)
 
 
 class Database:
@@ -495,7 +526,7 @@ class Database:
                 """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id = ?
                 """,
@@ -506,17 +537,7 @@ class Database:
 
             # Check Jellyfin availability (has_file means Radarr downloaded & imported)
             in_jellyfin = bool(row["has_file"])
-
-            # Get OTT platforms
-            ott_rows = conn.execute(
-                """
-                SELECT DISTINCT provider_name
-                FROM availability
-                WHERE movie_id = ? AND country_code = ?
-                """,
-                (row["id"], country_code.upper()),
-            ).fetchall()
-            ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+            ott_platforms = _ott_for_movie(row["id"], country_code, conn)
 
             return {
                 "id": row["id"],
@@ -532,6 +553,7 @@ class Database:
                 "trailer_key": row["trailer_key"],
                 "vote_average": row["vote_average"],
                 "director": row["director"],
+                "cast_top3": row["cast_top3"],
             }
 
     def get_short_movies(
@@ -547,7 +569,7 @@ class Database:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND m.runtime IS NOT NULL
@@ -565,15 +587,7 @@ class Database:
             results: list[dict] = []
             for row in rows:
                 in_jellyfin = bool(row["has_file"])
-                ott_rows = conn.execute(
-                    """
-                    SELECT DISTINCT provider_name
-                    FROM availability
-                    WHERE movie_id = ? AND country_code = ?
-                    """,
-                    (row["id"], country_code.upper()),
-                ).fetchall()
-                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                ott_platforms = _ott_for_movie(row["id"], country_code, conn)
                 results.append({
                     "id": row["id"],
                     "title": row["title"],
@@ -588,6 +602,7 @@ class Database:
                     "trailer_key": row["trailer_key"],
                     "vote_average": row["vote_average"],
                     "director": row["director"],
+                    "cast_top3": row["cast_top3"],
                 })
             return results
 
@@ -603,7 +618,7 @@ class Database:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
             """
@@ -619,15 +634,7 @@ class Database:
             results: list[dict] = []
             for row in rows:
                 in_jellyfin = bool(row["has_file"])
-                ott_rows = conn.execute(
-                    """
-                    SELECT DISTINCT provider_name
-                    FROM availability
-                    WHERE movie_id = ? AND country_code = ?
-                    """,
-                    (row["id"], country_code.upper()),
-                ).fetchall()
-                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                ott_platforms = _ott_for_movie(row["id"], country_code, conn)
                 results.append({
                     "id": row["id"],
                     "title": row["title"],
@@ -642,6 +649,7 @@ class Database:
                     "trailer_key": row["trailer_key"],
                     "vote_average": row["vote_average"],
                     "director": row["director"],
+                    "cast_top3": row["cast_top3"],
                 })
             return results
 
@@ -759,15 +767,7 @@ class Database:
             results: list[dict] = []
             for row in rows:
                 in_jellyfin = bool(row["has_file"])
-                ott_rows = conn.execute(
-                    """
-                    SELECT DISTINCT provider_name
-                    FROM availability
-                    WHERE movie_id = ? AND country_code = ?
-                    """,
-                    (row["id"], country_code.upper()),
-                ).fetchall()
-                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                ott_platforms = _ott_for_movie(row["id"], country_code, conn)
                 results.append({
                     "tmdb_id": row["tmdb_id"],
                     "title": row["title"],
@@ -825,9 +825,10 @@ class Database:
                     conditions.append(
                         "(LOWER(m.title) LIKE ? OR LOWER(m.tmdb_title) LIKE ? "
                         "OR LOWER(m.tmdb_original_title) LIKE ? "
-                        "OR LOWER(m.genre) LIKE ? OR LOWER(m.tmdb_overview) LIKE ?)"
+                        "OR LOWER(m.genre) LIKE ? OR LOWER(m.tmdb_overview) LIKE ? "
+                        "OR LOWER(m.cast_top3) LIKE ?)"
                     )
-                    params.extend([like, like, like, like, like])
+                    params.extend([like, like, like, like, like, like])
 
                 where_clause = " OR ".join(conditions)
                 exclude_clause = ""
@@ -839,7 +840,7 @@ class Database:
                 query = f"""
                     SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                            m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                           m.vote_average, m.director
+                           m.vote_average, m.director, m.cast_top3
                     FROM movies m
                     WHERE m.tmdb_id IS NOT NULL
                       AND ({where_clause})
@@ -853,15 +854,7 @@ class Database:
             results: list[dict] = []
             for row in rows:
                 in_jellyfin = bool(row["has_file"])
-                ott_rows = conn.execute(
-                    """
-                    SELECT DISTINCT provider_name
-                    FROM availability
-                    WHERE movie_id = ? AND country_code = ?
-                    """,
-                    (row["id"], country_code.upper()),
-                ).fetchall()
-                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                ott_platforms = _ott_for_movie(row["id"], country_code, conn)
 
                 results.append({
                     "id": row["id"],
@@ -877,6 +870,7 @@ class Database:
                     "trailer_key": row["trailer_key"],
                     "vote_average": row["vote_average"],
                     "director": row["director"],
+                    "cast_top3": row["cast_top3"],
                 })
             return results
 
@@ -884,15 +878,7 @@ class Database:
         """Convert a movie query row to a full dict with availability info."""
         with self._connect() as conn:
             in_jellyfin = bool(row["has_file"])
-            ott_rows = conn.execute(
-                """
-                SELECT DISTINCT provider_name
-                FROM availability
-                WHERE movie_id = ? AND country_code = ?
-                """,
-                (row["id"], country_code.upper()),
-            ).fetchall()
-            ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+            ott_platforms = _ott_for_movie(row["id"], country_code, conn)
             return {
                 "id": row["id"],
                 "title": row["title"],
@@ -907,7 +893,40 @@ class Database:
                 "trailer_key": row["trailer_key"],
                 "vote_average": row["vote_average"],
                 "director": row["director"],
+                "cast_top3": row["cast_top3"],
             }
+
+    def get_movies_by_actor(
+        self,
+        actor: str,
+        country_code: str = "IN",
+        limit: int = 20,
+        exclude_ids: Optional[list[int]] = None,
+    ) -> list[dict]:
+        """Return movies featuring an actor (LIKE match on cast_top3)."""
+        exclude = exclude_ids or []
+        with self._connect() as conn:
+            query = """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director, m.cast_top3
+                FROM movies m
+                WHERE m.tmdb_id IS NOT NULL
+                  AND LOWER(m.cast_top3) LIKE ?
+            """
+            params: list = [f"%{actor.lower()}%"]
+            if exclude:
+                placeholders = ",".join("?" for _ in exclude)
+                query += f" AND m.tmdb_id NOT IN ({placeholders})"
+                params.extend(exclude)
+            query += " ORDER BY m.has_file DESC, m.tmdb_popularity DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            results.append(self._movie_row_to_dict(row, country_code))
+        return results
 
     def get_movies_by_director(
         self,
@@ -922,7 +941,7 @@ class Database:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND LOWER(m.director) LIKE ?
@@ -954,7 +973,7 @@ class Database:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND LOWER(m.genre) LIKE ?
@@ -993,7 +1012,7 @@ class Database:
             query = f"""
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND ({where_clause})
@@ -1024,7 +1043,7 @@ class Database:
             query = """
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND (m.origin_country IS NULL OR LOWER(m.origin_country) NOT LIKE ?)
@@ -1073,7 +1092,7 @@ class Database:
             sql = f"""
                 SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
                        m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
-                       m.vote_average, m.director
+                       m.vote_average, m.director, m.cast_top3
                 FROM movies m
                 WHERE m.tmdb_id IS NOT NULL
                   AND ({where_clause})
@@ -1123,15 +1142,7 @@ class Database:
             results: list[dict] = []
             for row in rows:
                 in_jellyfin = bool(row["has_file"])
-                ott_rows = conn.execute(
-                    """
-                    SELECT DISTINCT provider_name
-                    FROM availability
-                    WHERE movie_id = ? AND country_code = ?
-                    """,
-                    (row["id"], country_code.upper()),
-                ).fetchall()
-                ott_platforms = ", ".join(r["provider_name"] for r in ott_rows)
+                ott_platforms = _ott_for_movie(row["id"], country_code, conn)
                 results.append({
                     "id": row["id"],
                     "title": row["title"],
@@ -1149,6 +1160,91 @@ class Database:
                     "vote_average": row["vote_average"],
                 })
             return results
+
+    def get_movie_details_for_tool(self, tmdb_id: int) -> Optional[dict]:
+        """Return rich movie details for Gemini's get_movie_details tool.
+
+        Includes all metadata fields needed for detailed discussion.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director, m.cast_top3, m.mood_tags,
+                       m.collection, m.origin_country, m.keywords
+                FROM movies m
+                WHERE m.tmdb_id = ?
+                """,
+                (tmdb_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            in_jellyfin = bool(row["has_file"])
+            ott_platforms = _ott_for_movie(row["id"], "IN", conn)
+
+            return {
+                "id": row["id"],
+                "title": row["title"],
+                "year": row["year"],
+                "tmdb_id": row["tmdb_id"],
+                "genre": row["genre"],
+                "runtime": row["runtime"],
+                "overview": row["tmdb_overview"],
+                "in_jellyfin": in_jellyfin,
+                "ott_platforms": ott_platforms,
+                "director": row["director"],
+                "cast_top3": row["cast_top3"],
+                "mood_tags": row["mood_tags"],
+                "collection": row["collection"],
+                "origin_country": row["origin_country"],
+                "keywords": row["keywords"],
+                "vote_average": row["vote_average"],
+            }
+
+    def get_watch_history_for_tool(
+        self,
+        days_back: int = 7,
+        reaction: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Return recent watch history entries for Gemini's get_watch_history tool.
+
+        Filters by days_back and optional reaction.
+        """
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+
+        with self._connect() as conn:
+            if reaction:
+                rows = conn.execute(
+                    """
+                    SELECT wh.tmdb_id, wh.title, wh.reaction, wh.watched_at,
+                           m.genre, m.director, m.runtime
+                    FROM watch_history wh
+                    LEFT JOIN movies m ON wh.tmdb_id = m.tmdb_id
+                    WHERE wh.watched_at >= ?
+                      AND wh.reaction = ?
+                    ORDER BY wh.watched_at DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, reaction, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT wh.tmdb_id, wh.title, wh.reaction, wh.watched_at,
+                           m.genre, m.director, m.runtime
+                    FROM watch_history wh
+                    LEFT JOIN movies m ON wh.tmdb_id = m.tmdb_id
+                    WHERE wh.watched_at >= ?
+                    ORDER BY wh.watched_at DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, limit),
+                ).fetchall()
+            return [dict(row) for row in rows]
 
     def get_all_directors(self) -> list[str]:
         """Return all unique non-null director names. Used for intent classification."""
@@ -1173,3 +1269,158 @@ class Database:
                     if g:
                         genres.add(g.lower())
             return list(genres)
+
+    def upsert_movie_from_chat(
+        self,
+        title: str,
+        year: Optional[int] = None,
+        tmdb_id: Optional[int] = None,
+        tmdb_title: Optional[str] = None,
+        tmdb_original_title: Optional[str] = None,
+        tmdb_release_year: Optional[int] = None,
+        tmdb_overview: Optional[str] = None,
+        tmdb_popularity: Optional[float] = None,
+        poster_url: Optional[str] = None,
+        genre: Optional[str] = None,
+        runtime: Optional[int] = None,
+    ) -> int:
+        """Insert a new movie from chat with synthetic letterboxd_slug/url.
+
+        Creates a synthetic slug and URL so the movies table constraints
+        (letterboxd_slug UNIQUE, letterboxd_url NOT NULL) are satisfied
+        even when the movie doesn't come from a Letterboxd sync.
+        If the movie already exists (by tmdb_id or title+year), it updates instead.
+        """
+        now = utc_now()
+        # Synthetic slug to satisfy the UNIQUE constraint
+        slug = f"chat-{title.lower().replace(' ', '-')}"
+        if year:
+            slug += f"-{year}"
+        if tmdb_id:
+            slug += f"-tmdb{tmdb_id}"
+        synthetic_url = f"https://letterboxd.com/film/{slug}/"
+
+        with self._connect() as conn:
+            # Check if movie already exists by tmdb_id or title+year
+            existing = None
+            if tmdb_id:
+                existing = conn.execute(
+                    "SELECT id FROM movies WHERE tmdb_id = ? LIMIT 1",
+                    (tmdb_id,),
+                ).fetchone()
+            if not existing and title:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM movies
+                    WHERE title = ? AND COALESCE(year, -1) = COALESCE(?, -1)
+                    LIMIT 1
+                    """,
+                    (title, year),
+                ).fetchone()
+
+            if existing:
+                # Update existing movie with any new data
+                conn.execute(
+                    """
+                    UPDATE movies
+                    SET tmdb_id = COALESCE(?, tmdb_id),
+                        tmdb_title = COALESCE(?, tmdb_title),
+                        tmdb_original_title = COALESCE(?, tmdb_original_title),
+                        tmdb_release_year = COALESCE(?, tmdb_release_year),
+                        tmdb_overview = COALESCE(?, tmdb_overview),
+                        tmdb_popularity = COALESCE(?, tmdb_popularity),
+                        poster_url = COALESCE(?, poster_url),
+                        genre = COALESCE(?, genre),
+                        runtime = COALESCE(?, runtime),
+                        last_seen_watchlist_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        tmdb_id, tmdb_title, tmdb_original_title,
+                        tmdb_release_year, tmdb_overview, tmdb_popularity,
+                        poster_url, genre, runtime,
+                        now, now, existing["id"],
+                    ),
+                )
+                movie_id = int(existing["id"])
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO movies (
+                        letterboxd_slug, letterboxd_url,
+                        title, year,
+                        tmdb_id, tmdb_title, tmdb_original_title,
+                        tmdb_release_year, tmdb_overview, tmdb_popularity,
+                        poster_url, genre, runtime,
+                        requested_in_radarr, requested_in_radarr_at, radarr_movie_id,
+                        first_seen_watchlist_at, last_seen_watchlist_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        slug, synthetic_url,
+                        title, year,
+                        tmdb_id, tmdb_title, tmdb_original_title,
+                        tmdb_release_year, tmdb_overview, tmdb_popularity,
+                        poster_url, genre, runtime,
+                        0, None, None,
+                        now, now, now, now,
+                    ),
+                )
+                movie_id = int(cursor.lastrowid)
+            conn.commit()
+            return movie_id
+
+    def get_ready_movies(
+        self,
+        country_code: str = "IN",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return movies with has_file=1 (downloaded and ready to play).
+
+        Paginated with limit/offset. Ordered by title alphabetically.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.id, m.title, m.year, m.tmdb_id, m.poster_url, m.genre,
+                       m.runtime, m.tmdb_overview, m.has_file, m.trailer_key,
+                       m.vote_average, m.director, m.cast_top3
+                FROM movies m
+                WHERE m.has_file = 1 AND m.tmdb_id IS NOT NULL
+                ORDER BY m.title ASC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+
+            results: list[dict] = []
+            for row in rows:
+                ott_platforms = _ott_for_movie(row["id"], country_code, conn)
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "year": row["year"],
+                    "tmdb_id": row["tmdb_id"],
+                    "poster_url": row["poster_url"],
+                    "genre": row["genre"],
+                    "runtime": row["runtime"],
+                    "overview": row["tmdb_overview"],
+                    "in_jellyfin": True,
+                    "ott_platforms": ott_platforms,
+                    "trailer_key": row["trailer_key"],
+                    "vote_average": row["vote_average"],
+                    "director": row["director"],
+                    "cast_top3": row["cast_top3"],
+                })
+            return results
+
+    def count_ready_movies(self) -> int:
+        """Count movies with has_file=1 (downloaded and ready)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM movies WHERE has_file = 1 AND tmdb_id IS NOT NULL"
+            ).fetchone()
+            return int(row[0]) if row else 0
