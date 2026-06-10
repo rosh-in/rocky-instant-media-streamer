@@ -121,11 +121,38 @@ async def jellyfin_playback(request: Request) -> dict:
         return {"status": "error", "message": str(exc)}
 
 
+async def _send_telegram_notification(title: str, event_type: str) -> None:
+    """Send a Telegram push notification for a new movie arrival.
+
+    Uses TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from environment.
+    Non-critical — logs and swallows errors so webhook processing is never blocked.
+    """
+    import os
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not bot_token or not chat_id_raw:
+        logger.info("Telegram notification skipped — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+        return
+    try:
+        chat_id = int(chat_id_raw)
+        import requests as req
+        text = f"🎬 New arrival: *{title}*\nRocky observe this movie is now in your library. Ready to watch."
+        req.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        logger.info("Telegram notification sent for '%s' (event=%s)", title, event_type)
+    except Exception as exc:
+        logger.warning("Telegram notification failed for '%s': %s", title, exc)
+
+
 @app.post("/webhook/radarr")
 async def radarr_webhook(request: Request) -> dict:
     """Handle Radarr webhook notifications.
 
     Logs movie grab/import events for reference.
+    Sends Telegram push notification on new movie arrivals.
     """
     try:
         content_type = request.headers.get("content-type", "")
@@ -146,6 +173,11 @@ async def radarr_webhook(request: Request) -> dict:
             tmdb_id = movie_data.get("tmdbId")
 
         logger.info("Radarr event: %s — %s (tmdb_id=%s)", event_type, title, tmdb_id)
+
+        # Send Telegram push notification for new arrivals
+        arrival_events = {"Download", "MovieImported", "MovieFileImported", "Grab"}
+        if event_type in arrival_events and title:
+            await _send_telegram_notification(title, event_type)
 
         return {"status": "ok", "eventType": event_type, "title": title}
 
