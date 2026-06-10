@@ -1,10 +1,9 @@
-"""Watchlist progress card generator — pure SQL stats from the local DB."""
+"""Watchlist progress card generator — formatted text stats from the local DB."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 
 def generate_stats(db_path: Path, country_code: str = "IN") -> str:
@@ -56,16 +55,6 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
             (country_code.upper(),),
         ).fetchone()[0]
 
-        # Oldest unwatched
-        oldest = conn.execute(
-            "SELECT title, year FROM movies WHERE tmdb_id IS NOT NULL ORDER BY year ASC LIMIT 1"
-        ).fetchone()
-
-        # Recently added
-        recent = conn.execute(
-            "SELECT title FROM movies WHERE tmdb_id IS NOT NULL ORDER BY created_at DESC LIMIT 3"
-        ).fetchall()
-
         # Top genre
         top_genre_row = conn.execute(
             """
@@ -78,24 +67,30 @@ def generate_stats(db_path: Path, country_code: str = "IN") -> str:
             """
         ).fetchone()
 
-    # Build the message
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%b %d, %Y")
-
-    oldest_text = f"{oldest['title']} ({oldest['year']})" if oldest else "—"
-    recent_text = ", ".join(r["title"] for r in recent) if recent else "—"
     top_genre = top_genre_row["genre"] if top_genre_row else "—"
+    top_genre = top_genre.replace("/", " · ")
+
+    # MarkdownV2 requires escaping these characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    def _esc(s: str) -> str:
+        for ch in ("_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
+            s = s.replace(ch, f"\\{ch}")
+        return s
+
+    date_esc = _esc(date_str)
+    genre_esc = _esc(top_genre)
 
     return (
-        f"Rocky count things. Rocky love count things.\n\n"
-        f"📊 *Week of {date_str}*\n\n"
-        f"📋 Watchlist: {total} movie\n"
-        f"✅ Ready watch: {in_jellyfin} movie\n"
-        f"🎬 OTT only: {on_ott_only} movie\n"
-        f"❌ Not yet: {not_available} movie\n\n"
-        f"🕰 Oldest waiting: {oldest_text}\n"
-        f"Rocky recommend this one soon.\n\n"
-        f"🎭 Top genre: {top_genre}\n\n"
-        f"Seven days. Rocky observe all.\n"
-        f"_{in_jellyfin} movie ready watch right now._"
+        f"🪨 *Rocky\\'s Weekly Report*\n"
+        f"_Week of {date_esc}_\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📋 *{total}* movies tracked\n"
+        f"✅ *{in_jellyfin}* ready to watch right now\n"
+        f"🎬 *{on_ott_only}* OTT only\n"
+        f"⏳ *{not_available}* not yet available\n"
+        f"━━━━━━━━━━━━━━━\n\n\n"
+        f"🎭 *Top genre:* {genre_esc}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"_Rocky has spoken\\._"
     )
