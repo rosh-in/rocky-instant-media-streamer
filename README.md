@@ -6,6 +6,8 @@
 
 ---
 
+Check out the demo here - https://youtube.com/shorts/7OYV0IK9ZjA?si=z9q6jSUWZIyi99pD
+
 Rocky's personality is entirely inspired by Rocky from *Project Hail Mary*.
 
 I suffer from severe decision fatigue trying to choose an OTT movie to watch. I'd scroll endlessly and end up not watching anything sometimes.
@@ -14,6 +16,9 @@ Rocky is a bot I made to solve that. I went from wasting 20 mins jumping across 
 
 ---
 ## ROCKY DEMO
+
+
+
 
 https://github.com/user-attachments/assets/ef0414a8-c541-46d3-be20-fa786dd1cf5f
 
